@@ -482,7 +482,7 @@ elif nav_choice == "🔄 Expected vs Actual Viewer":
                 colorbar=dict(title="dB", len=0.8),
             )
         )
-        fig_obs.update_layout(**_PLOTLY_LAYOUT, height=360, margin=dict(l=40, r=20, t=30, b=30))
+        fig_obs.update_layout(**{**_PLOTLY_LAYOUT, "height": 360, "margin": dict(l=40, r=20, t=30, b=30)})
         st.plotly_chart(fig_obs, use_container_width=True)
         st.caption(f"Area Mean Observed: {obs_val:.2f} dB")
 
@@ -499,7 +499,7 @@ elif nav_choice == "🔄 Expected vs Actual Viewer":
                 colorbar=dict(title="dB", len=0.8),
             )
         )
-        fig_pred.update_layout(**_PLOTLY_LAYOUT, height=360, margin=dict(l=40, r=20, t=30, b=30))
+        fig_pred.update_layout(**{**_PLOTLY_LAYOUT, "height": 360, "margin": dict(l=40, r=20, t=30, b=30)})
         st.plotly_chart(fig_pred, use_container_width=True)
         st.caption(f"Weather-Aware Prediction: {pred_val:.2f} dB")
 
@@ -517,7 +517,7 @@ elif nav_choice == "🔄 Expected vs Actual Viewer":
                 colorbar=dict(title="Δ dB", len=0.8),
             )
         )
-        fig_res.update_layout(**_PLOTLY_LAYOUT, height=360, margin=dict(l=40, r=20, t=30, b=30))
+        fig_res.update_layout(**{**_PLOTLY_LAYOUT, "height": 360, "margin": dict(l=40, r=20, t=30, b=30)})
         st.plotly_chart(fig_res, use_container_width=True)
         st.caption(f"Residual: {obs_val - pred_val:.2f} dB (Z = {z_w:.2f})")
 
