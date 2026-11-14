@@ -1,0 +1,40 @@
+# ─── Python ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ─── Environment ────────────────────────────────────────────────────────
+.env
+.venv/
+venv/
+env/
+
+# ─── Data (keep structure, ignore large files) ─────────────────────────
+data/raw/*.tif
+data/raw/*.nc
+data/raw/*.zip
+data/raw/*.safe
+data/processed/*.nc
+data/processed/*.zarr
+
+# ─── Results ────────────────────────────────────────────────────────────
+results/*.nc
+
+# ─── IDE / OS ───────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Streamlit ──────────────────────────────────────────────────────────
+.streamlit/secrets.toml
+
+# ─── Jupyter ────────────────────────────────────────────────────────────
+.ipynb_checkpoints/

@@ -1,0 +1,465 @@
+# CounterSAR
+## Is It Unusual, or Just the Season?
+
+**Project Domain:** Artificial Intelligence, Satellite Remote Sensing, Environmental Monitoring and Geospatial Analysis
+
+**Hackathon:** NASA Space Apps Challenge
+
+**Challenge:** Dancing With the SARs
+
+---
+
+# 1. Executive Summary
+
+CounterSAR is an AI-powered environmental monitoring platform designed to identify unusual changes on Earth's surface using Synthetic Aperture Radar (SAR) satellite observations.
+
+The project addresses a major limitation of conventional satellite change-detection systems: their inability to reliably distinguish genuine environmental disturbances from normal seasonal and weather-related changes.
+
+Radar observations can change significantly because of rainfall, soil moisture, vegetation growth, agricultural activities and seasonal flooding. Consequently, traditional image-comparison techniques may generate false alarms by interpreting normal environmental variations as disasters.
+
+CounterSAR addresses this problem by learning the historical behaviour of geographical locations and predicting what radar observations should normally look like under specific seasonal and weather conditions.
+
+The system compares these predictions with actual satellite observations and identifies changes that cannot adequately be explained by normal environmental conditions.
+
+The project will initially focus on Kuttanad, Kerala, using historical Sentinel-1 observations and supporting environmental datasets. Available NISAR observations will be incorporated to demonstrate the application of L-band radar technology.
+
+The final product will be an interactive geospatial application that visualises environmental changes, explains detected anomalies, displays prediction uncertainty and allows users to explore historical satellite observations.
+
+# 2. Introduction
+
+## 2.1 Background
+
+Synthetic Aperture Radar (SAR) is a remote-sensing technology that uses radar signals to observe Earth's surface.
+
+Unlike conventional optical satellite imagery, SAR does not depend on reflected sunlight and can acquire observations during both daytime and nighttime. It can also operate through cloud cover, making it particularly useful for environmental monitoring during monsoon seasons.
+
+The NASA–ISRO Synthetic Aperture Radar (NISAR) mission is an international collaboration between NASA and ISRO. The mission carries L-band and S-band radar instruments designed to monitor changes in Earth's surface.
+
+SAR observations provide valuable information for monitoring:
+
+- Flooding and surface-water changes.
+- Agricultural activities and vegetation.
+- Forest disturbances.
+- Ground deformation.
+- Natural disasters and environmental changes.
+
+However, interpreting SAR observations accurately remains challenging because radar signals respond to several different environmental factors.
+
+## 2.2 Problem Identification
+
+Traditional satellite change-detection approaches frequently compare observations acquired on different dates.
+
+Significant differences between observations are interpreted as potential environmental changes.
+
+However, not every change represents an environmental disaster.
+
+For example, agricultural fields in monsoon regions may experience intentional flooding during cultivation. Similarly, rainfall and soil-moisture variations can produce significant changes in radar backscatter.
+
+These conditions may generate false alarms in conventional monitoring systems.
+
+The central problem is therefore:
+
+**How can satellite-based monitoring systems distinguish normal seasonal and weather-related variations from genuinely unusual environmental events?**
+
+# 3. Proposed Solution: CounterSAR
+
+CounterSAR proposes an AI-driven approach that learns the expected radar behaviour of a geographical location under different environmental conditions.
+
+Instead of relying exclusively on image-to-image comparison, the system predicts the radar response expected for a particular location and date.
+
+It then compares the predicted response against the actual satellite observation.
+
+The difference is analysed to determine whether the observed change can be explained by normal seasonal or weather-related conditions.
+
+The system focuses on identifying unexplained deviations rather than treating every change as a potential disaster.
+
+## 3.1 Core Concept
+
+CounterSAR follows three major analytical stages:
+
+**Stage 1: Seasonal Expectation**
+
+The system learns historical environmental and radar patterns for different seasons.
+
+**Stage 2: Weather-Aware Expectation**
+
+The system incorporates actual environmental information, including rainfall and soil moisture, to predict the expected radar response under current conditions.
+
+**Stage 3: Anomaly Identification**
+
+The predicted radar response is compared with the actual observation.
+
+Changes that cannot adequately be explained by the model are flagged as potential anomalies.
+
+## 3.2 Three Possible Outcomes
+
+| Seasonal Expectation | Weather-Aware Expectation | Interpretation |
+|---|---|---|
+| Normal | Normal | Expected environmental conditions |
+| Unusual | Normal | Unusual conditions explained by weather |
+| Unusual | Unusual | Unexplained anomaly requiring investigation |
+
+The final category receives particular attention because it represents changes that cannot be adequately explained by the model's seasonal and weather information.
+
+# 4. Primary Study Area
+
+## 4.1 Kuttanad, Kerala
+
+The initial implementation will focus on Kuttanad, Kerala.
+
+Kuttanad is a suitable study area because of its extensive agricultural activities, water-management practices and exposure to monsoon-related flooding.
+
+Agricultural fields may be intentionally flooded during cultivation, creating conditions in which conventional flood-detection approaches can generate false alarms.
+
+The region also experienced significant flooding during the 2018 Kerala floods, providing an opportunity to evaluate the system against a historical disaster.
+
+## 4.2 Study Area Boundaries
+
+Proposed geographical boundaries:
+
+- Longitude: 76.30° to 76.50° E
+- Latitude: 9.30° to 9.50° N
+
+Proposed spatial resolution: 100 metres.
+
+A focused study area will reduce data-processing requirements and allow the team to develop a more detailed demonstration.
+
+# 5. Data Sources
+
+CounterSAR combines satellite radar observations with supporting environmental datasets.
+
+| Dataset | Purpose |
+|---|---|
+| Sentinel-1 GRD | Historical SAR observations |
+| NISAR L-band GCOV | Additional radar observations and polarisation analysis |
+| ERA5-Land | Rainfall and temperature information |
+| SMAP | Soil-moisture observations |
+| Copernicus DEM | Terrain and elevation information |
+| ESA WorldCover | Land-cover classification |
+| Sentinel-2 | Optical visual context |
+| Independent flood-extent datasets | Historical event validation |
+
+Google Earth Engine will be used to access and preprocess most supporting datasets.
+
+NISAR observations will be incorporated subject to actual scene availability and successful data access.
+
+Sentinel-1 will remain the primary source for historical time-series analysis.
+
+Since Sentinel-1 and NISAR use different radar frequencies and observation characteristics, appropriate cross-sensor calibration and harmonisation will be necessary.
+
+# 6. Artificial Intelligence and Machine Learning
+
+## 6.1 Expected Radar Prediction
+
+The primary machine-learning component predicts expected radar backscatter values for a geographical location.
+
+Potential input variables include:
+
+- Geographical coordinates.
+- Observation date.
+- Day of the year.
+- Rainfall.
+- Soil moisture.
+- Temperature.
+- Land-cover type.
+- Crop-calendar information.
+
+The model learns relationships between environmental conditions and historical radar observations.
+
+## 6.2 Proposed Model
+
+The initial implementation will use Quantile Gradient Boosting through LightGBM.
+
+This approach is suitable for a hackathon because it provides a practical starting point for predicting expected radar values and estimating prediction uncertainty.
+
+More computationally demanding neural networks may be explored as optional improvements.
+
+## 6.3 Counterfactual Weather Analysis
+
+A central component of CounterSAR is its counterfactual analysis.
+
+The system evaluates the predicted radar response under two conditions:
+
+1. Actual observed weather conditions.
+2. A normal seasonal weather reference.
+
+This allows the system to investigate how much of an observed change can be explained by weather-related variations.
+
+The remaining unexplained difference becomes the primary anomaly candidate.
+
+## 6.4 Anomaly Scoring
+
+The system calculates a standardised deviation score:
+
+z = (R_obs - R_pred) / (σ_pred + ε)
+
+Where:
+
+- R_obs represents the actual radar observation.
+- R_pred represents the predicted radar observation.
+- σ_pred represents prediction uncertainty.
+- ε is a small numerical constant that prevents division by zero.
+
+A larger deviation indicates that the observed radar response differs substantially from the expected response.
+
+Additional persistence checks across multiple satellite acquisitions will help reduce alerts caused by temporary noise.
+
+## 6.5 Conformal Prediction
+
+Conformal Prediction will be explored to calibrate anomaly thresholds using historical prediction errors.
+
+Its purpose is to provide statistically meaningful uncertainty estimates and establish an empirically controlled false-alarm target.
+
+The calibration process must account for the assumptions and dependencies present in the satellite time series.
+
+# 7. Application Features
+
+CounterSAR will provide an interactive application that presents satellite observations and machine-learning results in an accessible format.
+
+## 7.1 Interactive Earth Map
+
+Users can explore the selected geographical region through an interactive map.
+
+The map displays areas classified as normal, unusual or requiring further investigation.
+
+## 7.2 Expected vs Actual Viewer
+
+Users can compare:
+
+- Actual satellite observations.
+- AI-predicted observations.
+- Anomaly maps.
+- Prediction uncertainty.
+
+A swipe-based interface will allow users to visually compare the different layers.
+
+## 7.3 Historical Time Machine
+
+The application will provide a historical view of the study area.
+
+Users can navigate through different observation dates and understand how environmental conditions evolved.
+
+The 2018 Kerala floods will serve as the primary historical demonstration.
+
+## 7.4 Anomaly Explanation
+
+Each detected anomaly will have an associated explanation card.
+
+The card will contain:
+
+- Observed radar changes.
+- Relevant environmental conditions.
+- Model confidence or uncertainty.
+- Possible physical explanations.
+- Recommended further investigation.
+
+The application will distinguish between measured observations, contextual information and hypotheses.
+
+## 7.5 Polarisation Explorer
+
+Where compatible data is available, users will be able to explore different radar polarisations.
+
+This feature will demonstrate how different radar channels provide information about vegetation, surface water and other environmental characteristics.
+
+## 7.6 Story Mode
+
+A guided visual presentation will introduce users to the study area, explain normal seasonal behaviour and demonstrate how CounterSAR analyses the 2018 Kerala floods.
+
+Story Mode will be designed to make the scientific concepts understandable to non-specialists.
+
+# 8. Technical Architecture
+
+The proposed system consists of five major components.
+
+**1. Data Acquisition Layer**
+
+Collects SAR observations and supporting environmental datasets.
+
+**2. Data Processing Layer**
+
+Performs spatial filtering, preprocessing, aggregation and alignment of observations.
+
+**3. Prediction Layer**
+
+Uses machine-learning models to estimate expected radar observations.
+
+**4. Anomaly Detection Layer**
+
+Compares predicted and observed values, calculates deviations and evaluates uncertainty.
+
+**5. Application Layer**
+
+Displays geographical information, historical observations, anomaly maps and explanations.
+
+### Proposed Technology Stack
+
+| Component | Technology |
+|---|---|
+| Programming | Python |
+| Satellite processing | Google Earth Engine |
+| Numerical computing | NumPy |
+| Multidimensional data | Xarray |
+| Raster processing | Rasterio |
+| Machine learning | Scikit-learn, LightGBM |
+| Interface | Streamlit |
+| Interactive maps | Folium |
+| Data storage | NetCDF / Zarr |
+| Version control | Git and GitHub |
+
+# 9. Research Gap and Innovation
+
+Existing satellite change-detection approaches can confuse ordinary seasonal variations with environmental disturbances.
+
+Historical radar prediction and anomaly-detection methods have also been explored in previous research.
+
+Therefore, CounterSAR does not claim that predicting expected radar behaviour is an entirely new concept.
+
+Instead, its proposed contribution focuses on combining several elements.
+
+### 9.1 Weather-Conditioned Prediction
+
+Environmental information such as rainfall and soil moisture is incorporated into radar prediction.
+
+### 9.2 Counterfactual Attribution
+
+Observed deviations are analysed to distinguish seasonal changes, weather-explained changes and unexplained changes.
+
+### 9.3 Calibrated Uncertainty
+
+Conformal calibration is used to establish meaningful anomaly thresholds and evaluate false-alarm behaviour.
+
+### 9.4 Indian Monsoon Paddy Case Study
+
+The system will be evaluated in an agricultural region where normal water-management practices can resemble disaster-related flooding.
+
+The combination of these elements forms the proposed research contribution.
+
+Novelty claims must remain qualified until a more exhaustive literature review is completed.
+
+# 10. Validation and Evaluation
+
+The project must demonstrate that CounterSAR performs better than conventional change-detection approaches for its intended use case.
+
+The proposed evaluation will compare:
+
+1. Traditional image differencing.
+2. Radar log-ratio thresholding.
+3. Seasonal-only prediction.
+4. Weather-conditioned CounterSAR.
+
+The 2018 Kerala flood will be held out from model training and used for historical event evaluation.
+
+Other available years will be used for training and calibration, with appropriate separation between those datasets.
+
+### Proposed Evaluation Metrics
+
+| Metric | Purpose |
+|---|---|
+| Precision | Measures the proportion of flagged events that correspond to validated events |
+| Recall | Measures how many validated events were detected |
+| F1-score | Balances precision and recall |
+| False alarms per unit area | Measures unnecessary alerts |
+| Prediction error | Evaluates expected radar prediction |
+| Calibration performance | Evaluates uncertainty estimates |
+
+### Proposed Success Targets
+
+These are initial targets and must be evaluated through actual experiments.
+
+- At least 15% lower prediction error than seasonal climatology.
+- At least 30% fewer false alarms than image differencing at equal recall.
+- Agreement between historical event detections and independent flood-extent information.
+- Improved flooded-vegetation classification using additional L-band polarisation information, where sufficient compatible data is available.
+
+The team should report actual experimental results, including results that fail to meet the proposed targets.
+
+# 11. Team Responsibilities
+
+The project has five assigned members.
+
+| Member | Role | Responsibilities |
+|---|---|---|
+| Moksha | Person A – Data Engineer | Sentinel-1 processing, environmental features, data organisation |
+| Shreya | Person B – NISAR/Radar Lead | NISAR data acquisition, calibration and polarisation analysis |
+| Nithish | Person C – Modelling Lead | Prediction models, anomaly scoring and machine-learning pipeline |
+| Tarun | Person D – Frontend Developer | Streamlit interface, maps, Story Mode and visualisation |
+| Pranav | Person E – Validation and Documentation | Flood validation, evaluation metrics, presentation, video and documentation |
+
+All members must follow the same geographical boundaries, spatial resolution, coordinate reference system, units and file organisation.
+
+# 12. Development Timeline
+
+The proposed hackathon schedule is divided into six phases.
+
+| Phase | Duration | Main Deliverables |
+|---|---|---|
+| Initial setup | T+0 to T+1 | Repository, shared data contract and project structure |
+| Data acquisition | T+1 to T+5 | Sentinel-1 data, NISAR scene assessment and initial application |
+| Baseline development | T+5 to T+9 | Historical features, climatology and initial prediction models |
+| Model evaluation | T+9 to T+13 | Anomaly detection, uncertainty and historical validation |
+| Application development | T+13 to T+18 | Interactive maps, comparison viewer and Story Mode |
+| Finalisation | T+18 to T+24 | Testing, documentation, video and submission |
+
+The project should reach feature freeze at T+18 and target submission by T+23.
+
+# 13. Risks and Limitations
+
+## 13.1 NISAR Data Availability
+
+The availability of suitable NISAR observations over Kuttanad must be verified.
+
+If insufficient scenes are available, Sentinel-1 will remain the historical dataset and NISAR will be presented as an additional demonstration.
+
+## 13.2 Cross-Sensor Differences
+
+Sentinel-1 and NISAR use different radar frequencies and polarisation configurations.
+
+Their measurements cannot be assumed to be directly interchangeable.
+
+Appropriate calibration and validation are required.
+
+## 13.3 False Anomaly Classification
+
+An unexplained statistical deviation does not automatically indicate a flood.
+
+Agricultural activities, construction, vegetation changes and radar noise may also produce anomalies.
+
+## 13.4 Limited Study Area
+
+The initial implementation focuses on one geographical region.
+
+Consequently, the results should not automatically be generalised to every geographical location.
+
+## 13.5 Prediction Uncertainty
+
+Machine-learning predictions are subject to uncertainty, particularly when environmental conditions differ significantly from the training observations.
+
+The application must communicate these limitations.
+
+# 14. Expected Outcomes
+
+The final CounterSAR application is expected to provide:
+
+1. An interactive geographical monitoring interface.
+2. Historical satellite observation visualisation.
+3. AI-based expected radar prediction.
+4. Weather-conditioned anomaly detection.
+5. Anomaly uncertainty and explanation.
+6. Comparison against traditional change-detection methods.
+7. Historical evaluation using the 2018 Kerala floods.
+8. An additional demonstration using available NISAR observations.
+9. Open-source project documentation and implementation.
+
+# 15. Conclusion
+
+CounterSAR proposes a more context-aware approach to satellite-based environmental monitoring.
+
+Rather than interpreting every radar difference as a potential disaster, the system considers historical seasonal patterns and actual environmental conditions before identifying unusual changes.
+
+By combining SAR observations, weather information, machine learning, counterfactual analysis and calibrated uncertainty, the project aims to make environmental monitoring more interpretable and reduce unnecessary alerts.
+
+Its initial focus on Kuttanad, Kerala, provides a relevant demonstration environment where seasonal agricultural water accumulation and genuine flooding can be difficult to distinguish.
+
+The ultimate objective is to develop an accessible, open-source platform that helps users understand not only what changed on Earth's surface, but also whether that change was expected and why it deserves attention.
+
+**CounterSAR: Earth never stops changing. We help you distinguish its natural rhythm from the unexpected.**
