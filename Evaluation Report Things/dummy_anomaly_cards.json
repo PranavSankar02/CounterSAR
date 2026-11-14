@@ -1,0 +1,26 @@
+[
+  {
+    "date": "2018-08-12",
+    "verdict": "Unexplained Candidate Event",
+    "confidence": 0.97,
+    "estimated_affected_area_km2": 116.44,
+    "unexplained_pixels": 11644,
+    "explained_pixels": 4547,
+    "environmental_drivers": {
+      "rainfall_mm": 9.99,
+      "soil_moisture": 0.275
+    }
+  },
+  {
+    "date": "2018-08-24",
+    "verdict": "Unexplained Candidate Event",
+    "confidence": 0.98,
+    "estimated_affected_area_km2": 103.37,
+    "unexplained_pixels": 10337,
+    "explained_pixels": 2854,
+    "environmental_drivers": {
+      "rainfall_mm": 10.07,
+      "soil_moisture": 0.275
+    }
+  }
+]
