@@ -67,7 +67,6 @@ from src.scorer import (
 )
 from src.skeleton import (
     CRS,
-    GRID_RES_DEG,
     GRID_RES_METERS,
     KUTTANAD_BOUNDS,
 )
@@ -908,7 +907,7 @@ elif nav_choice == "🗺️ Study Area Overview":
         - **Bounding Box**: Lat {KUTTANAD_BOUNDS['lat_min']}°N to {KUTTANAD_BOUNDS['lat_max']}°N, Lon {KUTTANAD_BOUNDS['lon_min']}°E to {KUTTANAD_BOUNDS['lon_max']}°E
         - **Elevation**: −0.5 to −2.5 m (Below Mean Sea Level)
         - **Total Area**: ~500 km²
-        - **Grid Standard**: 100 m Reference Grid ({GRID_RES_METERS} m, {GRID_RES_DEG}° res in EPSG:4326)
+        - **Grid Standard**: 100 m Reference Grid ({GRID_RES_METERS} m, projected in {CRS})
         - **Primary Crops**: Paddy rice (two cropping seasons: Punja and Virippu)
         """
         )
