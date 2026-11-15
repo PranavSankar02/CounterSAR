@@ -1,36 +1,5 @@
-"""
-CounterSAR — Prediction Models (Stage 3)
-=========================================
-Physics-guided and weather-aware predictive models for SAR backscatter
-over the Kuttanad study area (Kerala, India).
-
-Models:
-  1. SeasonalClimatologyModel:
-     - Baseline statistical climatology using day-of-year harmonic regression
-       and monthly mean / standard deviation statistics.
-     - Captures annual wet / dry monsoon cycles (SW monsoon flood dip in June–Sep,
-       NE monsoon in Oct–Nov, dry recovery in Dec–May).
-
-  2. WeatherAwareLGBMModel:
-     - Quantile Gradient Boosting (LightGBM) regressor.
-     - Predicts expected SAR backscatter conditioned on location, season,
-       rainfall (CHIRPS), soil moisture (ERA5), temperature, and antecedent rainfall.
-     - Quantile regression (10th, 50th, 90th percentiles) estimates physical
-       asymmetrical prediction uncertainty bounds without Gaussian assumptions.
-
-Scientific Principles:
-  - Natural variations in speckle and micro-topography produce normal fluctuations
-    (typically ±1 to 2 dB). Small differences between observed and predicted radar
-    values are expected and do NOT constitute anomalies or disasters.
-  - Anomaly candidates only arise when observed values diverge significantly beyond
-    the prediction uncertainty interval across multiple passes (persistence).
-  - Synthetic data is strictly tagged throughout; synthetic observations must never
-    be cited as evidence of real-world physical model performance.
-"""
-
 from __future__ import annotations
 
-import warnings
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -38,14 +7,8 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from src.skeleton import (
-    CRS,
-    DEFAULT_END_DATE,
-    DEFAULT_START_DATE,
-    PredictionResult,
-)
+from src.skeleton import PredictionResult
 
-# Optional LightGBM import with graceful fallback to scikit-learn
 try:
     import lightgbm as lgb
     HAS_LIGHTGBM = True
@@ -56,14 +19,7 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
-# ════════════════════════════════════════════════════════════════════════
-#  ABSTRACT BASE SAR MODEL
-# ════════════════════════════════════════════════════════════════════════
-
 class BaseSARModel(ABC):
-    """
-    Abstract interface for SAR backscatter prediction models.
-    """
 
     def __init__(self, model_name: str):
         self.model_name = model_name
@@ -76,16 +32,6 @@ class BaseSARModel(ABC):
         data: Union[xr.Dataset, pd.DataFrame],
         target_var: str = "vv_db",
     ) -> "BaseSARModel":
-        """
-        Fit model on historical observations.
-
-        Parameters
-        ----------
-        data : xr.Dataset or pd.DataFrame
-            Dataset produced by src/data_source.py containing target and covariates.
-        target_var : str
-            Name of target backscatter variable (default: 'vv_db').
-        """
         pass
 
     @abstractmethod
@@ -94,132 +40,203 @@ class BaseSARModel(ABC):
         data: Union[xr.Dataset, pd.DataFrame],
         confidence_level: float = 0.90,
     ) -> xr.Dataset:
-        """
-        Predict expected backscatter and uncertainty bounds.
-
-        Parameters
-        ----------
-        data : xr.Dataset or pd.DataFrame
-            Input covariates.
-        confidence_level : float
-            Coverage width for uncertainty interval (default: 0.90 for 10th..90th percentile).
-
-        Returns
-        -------
-        xr.Dataset
-            Contains 'predicted_backscatter_db', 'prediction_std',
-            'lower_bound_db', 'upper_bound_db', and 'residual_db' (if target present).
-        """
         pass
 
-    def to_prediction_results(self, pred_ds: xr.Dataset) -> List[PredictionResult]:
-        """
-        Convert prediction dataset into a list of shared PredictionResult dataclasses.
-        """
-        results = []
-        times = pd.to_datetime(pred_ds["time"].values)
-        y_hat = pred_ds["predicted_backscatter_db"].values
-        std = pred_ds["prediction_std"].values
-        lower = pred_ds["lower_bound_db"].values
-        upper = pred_ds["upper_bound_db"].values
-        is_synth = bool(pred_ds.attrs.get("is_synthetic", False))
+    def to_prediction_results(
+        self,
+        pred_ds: xr.Dataset,
+        y_index: int = 0,
+        x_index: int = 0,
+    ) -> List[PredictionResult]:
 
-        for i, t in enumerate(times):
+        if "y" not in pred_ds.dims or "x" not in pred_ds.dims:
+            raise ValueError("Prediction dataset must contain spatial y and x dimensions.")
+
+        if not (0 <= y_index < pred_ds.sizes["y"]):
+            raise IndexError("y_index is outside the prediction grid.")
+
+        if not (0 <= x_index < pred_ds.sizes["x"]):
+            raise IndexError("x_index is outside the prediction grid.")
+
+        times = pd.to_datetime(pred_ds["time"].values)
+
+        variables = [
+            "predicted_backscatter_db",
+            "prediction_std",
+            "lower_bound_db",
+            "upper_bound_db",
+        ]
+
+        values = {
+            name: pred_ds[name].isel(y=y_index, x=x_index).values
+            for name in variables
+        }
+
+        is_synth = bool(pred_ds.attrs.get("is_synthetic", False))
+        results = []
+
+        for i, timestamp in enumerate(times):
+            row = [values[name][i] for name in variables]
+
+            if not np.all(np.isfinite(row)):
+                continue
+
             results.append(
                 PredictionResult(
-                    date=t.strftime("%Y-%m-%d"),
-                    predicted_backscatter_db=float(y_hat[i]),
-                    prediction_std=float(std[i]),
-                    lower_bound_db=float(lower[i]),
-                    upper_bound_db=float(upper[i]),
+                    date=timestamp.strftime("%Y-%m-%d"),
+                    predicted_backscatter_db=float(row[0]),
+                    prediction_std=float(row[1]),
+                    lower_bound_db=float(row[2]),
+                    upper_bound_db=float(row[3]),
                     model_name=self.model_name,
                     is_synthetic=is_synth,
                 )
             )
+
         return results
 
 
-# ════════════════════════════════════════════════════════════════════════
-#  1. SEASONAL CLIMATOLOGY BASELINE MODEL
-# ════════════════════════════════════════════════════════════════════════
-
 class SeasonalClimatologyModel(BaseSARModel):
-    """
-    Seasonal Climatology Baseline Model.
-
-    Fits monthly climatological statistics (mean and standard deviation)
-    and a smooth dual-frequency Fourier harmonic regression on Day of Year (DOY):
-        σ⁰(doy) = a₀ + ∑_{k=1}² [aₖ sin(2π k doy / 365.25) + bₖ cos(2π k doy / 365.25)]
-
-    Captures the seasonal cycle of Kuttanad:
-      - Wet season monsoon drop (open water specular reflection)
-      - Dry season vegetative & soil roughness recovery
-    """
 
     def __init__(self, num_harmonics: int = 2):
-        super().__init__(model_name="seasonal_climatology")
+        super().__init__("seasonal_climatology")
         self.num_harmonics = num_harmonics
-        self.harmonic_weights: Optional[np.ndarray] = None
-        self.monthly_stats: Dict[int, Dict[str, float]] = {}
-        self.residual_std: float = 1.0
+        self.harmonic_weights = None
+        self.residual_std = None
+        self.spatial_shape = None
+        self.grid_coords = None
+        self.valid_pixel_mask = None
 
     def _harmonic_features(self, doy: np.ndarray) -> np.ndarray:
-        """Construct Fourier harmonic design matrix for day-of-year."""
-        features = [np.ones_like(doy)]
+        features = [np.ones_like(doy, dtype=np.float64)]
+
         for k in range(1, self.num_harmonics + 1):
             omega = 2.0 * np.pi * k / 365.25
             features.append(np.sin(omega * doy))
             features.append(np.cos(omega * doy))
+
         return np.column_stack(features)
+
+    def _get_target(self, data: xr.Dataset, target_var: str) -> np.ndarray:
+        if target_var not in data:
+            raise ValueError(f"Target variable '{target_var}' not found.")
+
+        target = data[target_var]
+
+        if "time" not in target.dims:
+            raise ValueError("Target variable must contain a time dimension.")
+
+        if "y" not in target.dims or "x" not in target.dims:
+            raise ValueError("Target variable must contain spatial y and x dimensions.")
+
+        return np.asarray(
+            target.transpose("time", "y", "x").values,
+            dtype=np.float32,
+        )
 
     def fit(
         self,
         data: Union[xr.Dataset, pd.DataFrame],
         target_var: str = "vv_db",
     ) -> "SeasonalClimatologyModel":
-        """
-        Fit harmonic seasonal curve and monthly statistics.
-        """
+
+        if not isinstance(data, xr.Dataset):
+            raise TypeError("SeasonalClimatologyModel requires an xarray Dataset.")
+
         self.target_var = target_var
 
-        if isinstance(data, xr.Dataset):
-            times = pd.to_datetime(data["time"].values)
-            y = data[target_var].values
-        else:
-            time_col = "date" if "date" in data.columns else "time"
-            times = pd.to_datetime(data[time_col].values)
-            y = data[target_var].values
+        times = pd.DatetimeIndex(pd.to_datetime(data["time"].values))
+        values = self._get_target(data, target_var)
 
-        # Valid finite mask
+        if len(times) < 5:
+            raise ValueError("At least five acquisition dates are required.")
+
+        n_time, height, width = values.shape
+        n_pixels = height * width
+
+        y = values.reshape(n_time, n_pixels).astype(np.float64)
         valid = np.isfinite(y)
-        if np.sum(valid) < 5:
-            raise ValueError(f"Insufficient valid data points to fit climatology: {np.sum(valid)} found.")
 
-        y_valid = y[valid]
-        times_valid = times[valid]
-        doy = times_valid.dayofyear.values.astype(float)
-        months = times_valid.month.values
+        valid_counts = valid.sum(axis=0)
+        valid_pixels = valid_counts >= max(5, self.num_harmonics * 2 + 1)
 
-        # 1. Compute monthly statistics (mean and std per month)
-        self.monthly_stats = {}
-        for m in range(1, 13):
-            mask_m = months == m
-            if np.any(mask_m):
-                self.monthly_stats[m] = {
-                    "mean": float(np.mean(y_valid[mask_m])),
-                    "std": float(max(np.std(y_valid[mask_m]), 0.4)),  # Minimum noise floor
-                }
-            else:
-                self.monthly_stats[m] = {"mean": float(np.mean(y_valid)), "std": 1.0}
+        if not np.any(valid_pixels):
+            raise ValueError("No spatial pixels have sufficient valid observations.")
 
-        # 2. Fit least-squares harmonic regression
+        doy = times.dayofyear.values.astype(float)
         X = self._harmonic_features(doy)
-        self.harmonic_weights, _, _, _ = np.linalg.lstsq(X, y_valid, rcond=None)
 
-        # 3. Calculate baseline residual standard deviation
-        preds = X @ self.harmonic_weights
-        residuals = y_valid - preds
-        self.residual_std = float(max(np.std(residuals), 0.5))
+        y_fit = np.where(valid, y, 0.0)
+        weights = valid.astype(np.float64)
+
+        xtwx = np.einsum(
+            "tf,tp,tg->pfg",
+            X,
+            weights,
+            X,
+            optimize=True,
+        )
+
+        xtwy = np.einsum(
+            "tf,tp,tp->pf",
+            X,
+            weights,
+            y_fit,
+            optimize=True,
+        )
+
+        coefficients = np.zeros(
+            (n_pixels, X.shape[1]),
+            dtype=np.float64,
+        )
+
+        coefficients[valid_pixels] = (
+            np.linalg.pinv(xtwx[valid_pixels])
+            @ xtwy[valid_pixels, :, None]
+        ).squeeze(-1)
+
+        predictions = X @ coefficients.T
+        residuals = np.where(valid, y - predictions, np.nan)
+
+        counts = valid.sum(axis=0)
+
+        residual_mean = (
+            np.nansum(residuals, axis=0)
+            / np.maximum(counts, 1)
+        )
+
+        residual_variance = (
+            np.nansum(
+                (residuals - residual_mean[None, :]) ** 2,
+                axis=0,
+            )
+            / np.maximum(counts, 1)
+        )
+
+        residual_std = np.maximum(
+            np.sqrt(residual_variance),
+            0.5,
+        )
+
+        residual_std[~valid_pixels] = np.nan
+
+        predictions[~valid] = np.nan
+
+        self.harmonic_weights = coefficients.reshape(
+            height,
+            width,
+            X.shape[1],
+        )
+
+        self.residual_std = residual_std.reshape(height, width)
+        self.spatial_shape = (height, width)
+        self.valid_pixel_mask = valid_pixels.reshape(height, width)
+
+        self.grid_coords = {
+            "y": data["y"].values,
+            "x": data["x"].values,
+            "time": data["time"].values,
+        }
 
         self.is_fitted = True
         return self
@@ -229,85 +246,113 @@ class SeasonalClimatologyModel(BaseSARModel):
         data: Union[xr.Dataset, pd.DataFrame],
         confidence_level: float = 0.90,
     ) -> xr.Dataset:
-        """
-        Predict expected seasonal backscatter and uncertainty intervals.
-        """
-        if not self.is_fitted:
-            raise RuntimeError("SeasonalClimatologyModel must be fitted before predict() is called.")
 
-        if isinstance(data, xr.Dataset):
-            times = pd.to_datetime(data["time"].values)
-            obs_y = data[self.target_var].values if self.target_var in data else None
-            is_synth = int(data.attrs.get("is_synthetic", 0))
-            coords = {"time": data["time"].values}
-        else:
-            time_col = "date" if "date" in data.columns else "time"
-            times = pd.to_datetime(data[time_col].values)
-            obs_y = data[self.target_var].values if self.target_var in data.columns else None
-            is_synth = int(data.get("is_synthetic", False).any() if "is_synthetic" in data else 0)
-            coords = {"time": times}
+        if not self.is_fitted:
+            raise RuntimeError("SeasonalClimatologyModel must be fitted first.")
+
+        if not isinstance(data, xr.Dataset):
+            raise TypeError("Prediction requires an xarray Dataset.")
+
+        if not 0 < confidence_level < 1:
+            raise ValueError("confidence_level must be between 0 and 1.")
+
+        times = pd.DatetimeIndex(pd.to_datetime(data["time"].values))
+        height, width = self.spatial_shape
+
+        if data.sizes["y"] != height or data.sizes["x"] != width:
+            raise ValueError("Prediction grid does not match the training grid.")
 
         doy = times.dayofyear.values.astype(float)
         X = self._harmonic_features(doy)
-        y_hat = X @ self.harmonic_weights
 
-        # Standard deviation for each observation point based on month and residual noise
-        months = times.month.values
-        stds = np.array([self.monthly_stats.get(m, {}).get("std", self.residual_std) for m in months])
-        # Blend monthly standard deviation with residual standard deviation
-        combined_std = np.sqrt(0.5 * (stds ** 2 + self.residual_std ** 2))
+        coefficients = self.harmonic_weights.reshape(
+            height * width,
+            -1,
+        )
 
-        # Two-tailed normal multiplier for the requested confidence level
+        predictions = X @ coefficients.T
+        predictions = predictions.reshape(len(times), height, width)
+
+        std = np.broadcast_to(
+            self.residual_std,
+            (len(times), height, width),
+        ).copy()
+
         from scipy.stats import norm
+
         z = norm.ppf(0.5 + confidence_level / 2.0)
 
-        lower_bound = y_hat - z * combined_std
-        upper_bound = y_hat + z * combined_std
+        lower = predictions - z * std
+        upper = predictions + z * std
+
+        valid_mask = np.broadcast_to(
+            self.valid_pixel_mask,
+            predictions.shape,
+        )
+
+        predictions[~valid_mask] = np.nan
+        std[~valid_mask] = np.nan
+        lower[~valid_mask] = np.nan
+        upper[~valid_mask] = np.nan
 
         data_vars = {
-            "predicted_backscatter_db": ("time", y_hat, {"units": "dB", "long_name": "Climatological Expected σ⁰"}),
-            "prediction_std": ("time", combined_std, {"units": "dB", "long_name": "Prediction Standard Deviation"}),
-            "lower_bound_db": ("time", lower_bound, {"units": "dB", "long_name": f"{int(confidence_level*100)}% Lower Uncertainty Bound"}),
-            "upper_bound_db": ("time", upper_bound, {"units": "dB", "long_name": f"{int(confidence_level*100)}% Upper Uncertainty Bound"}),
+            "predicted_backscatter_db": (
+                ("time", "y", "x"),
+                predictions.astype(np.float32),
+                {"units": "dB"},
+            ),
+            "prediction_std": (
+                ("time", "y", "x"),
+                std.astype(np.float32),
+                {"units": "dB"},
+            ),
+            "lower_bound_db": (
+                ("time", "y", "x"),
+                lower.astype(np.float32),
+                {"units": "dB"},
+            ),
+            "upper_bound_db": (
+                ("time", "y", "x"),
+                upper.astype(np.float32),
+                {"units": "dB"},
+            ),
         }
 
-        if obs_y is not None:
-            residuals = obs_y - y_hat
-            data_vars["observed_backscatter_db"] = ("time", obs_y, {"units": "dB"})
-            data_vars["residual_db"] = ("time", residuals, {"units": "dB", "long_name": "Residual (Observed − Expected)"})
+        if self.target_var in data:
+            observed = self._get_target(data, self.target_var)
+            residual = observed - predictions
 
-        out_ds = xr.Dataset(data_vars=data_vars, coords=coords)
-        out_ds.attrs["model_name"] = self.model_name
-        out_ds.attrs["confidence_level"] = confidence_level
-        out_ds.attrs["is_synthetic"] = is_synth
-        out_ds.attrs["notice"] = (
-            "⚠️ SYNTHETIC EVALUATION — Not real satellite observations"
-            if is_synth else "Climatology Model Prediction"
+            data_vars["observed_backscatter_db"] = (
+                ("time", "y", "x"),
+                observed,
+                {"units": "dB"},
+            )
+
+            data_vars["residual_db"] = (
+                ("time", "y", "x"),
+                residual.astype(np.float32),
+                {"units": "dB"},
+            )
+
+        out = xr.Dataset(
+            data_vars=data_vars,
+            coords={
+                "time": data["time"].values,
+                "y": data["y"].values,
+                "x": data["x"].values,
+            },
         )
-        return out_ds
 
+        out.attrs.update(data.attrs)
+        out.attrs["model_name"] = self.model_name
+        out.attrs["confidence_level"] = confidence_level
+        out.attrs["is_synthetic"] = bool(data.attrs.get("is_synthetic", False))
+        out.attrs["spatial_prediction"] = True
 
-# ════════════════════════════════════════════════════════════════════════
-#  2. WEATHER-AWARE PREDICTION MODEL (LightGBM Quantile Regression)
-# ════════════════════════════════════════════════════════════════════════
+        return out
+
 
 class WeatherAwareLGBMModel(BaseSARModel):
-    """
-    Weather-Aware Prediction Model using Quantile Gradient Boosting.
-
-    Features:
-      - Cyclical calendar: sin/cos Day-of-Year harmonics and month
-      - Environmental covariates: daily rainfall, soil moisture, surface temperature
-      - Hydrological delay: 3-day and 7-day antecedent cumulative rainfall
-      - Radar geometry: orbit pass direction (ascending vs descending)
-      - Spatial coordinates: latitude, longitude (when spatial grid is active)
-
-    Quantile Loss Estimation:
-      Trains three models for the 10th percentile (lower bound), 50th percentile (expected
-      median backscatter), and 90th percentile (upper bound).
-      This models asymmetric hydrological responses (e.g. abrupt flood drop vs gradual drying)
-      without forcing an unrealistic symmetric Gaussian distribution.
-    """
 
     def __init__(
         self,
@@ -317,116 +362,220 @@ class WeatherAwareLGBMModel(BaseSARModel):
         learning_rate: float = 0.05,
         max_depth: int = 4,
         random_state: int = 42,
+        max_training_samples: int = 100000,
+        prediction_batch_size: int = 250000,
     ):
-        super().__init__(model_name="weather_aware_lightgbm")
+        super().__init__("weather_aware_lightgbm")
+
+        if not 0 < alpha_lower < 0.5:
+            raise ValueError("alpha_lower must be between 0 and 0.5.")
+
+        if not 0.5 < alpha_upper < 1:
+            raise ValueError("alpha_upper must be between 0.5 and 1.")
+
         self.alpha_lower = alpha_lower
         self.alpha_upper = alpha_upper
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
         self.max_depth = max_depth
         self.random_state = random_state
+        self.max_training_samples = max_training_samples
+        self.prediction_batch_size = prediction_batch_size
 
-        self.lower_model: Optional[Any] = None
-        self.median_model: Optional[Any] = None
-        self.upper_model: Optional[Any] = None
-        self.feature_names: List[str] = []
+        self.lower_model = None
+        self.median_model = None
+        self.upper_model = None
+        self.feature_names = []
         self.use_lightgbm = HAS_LIGHTGBM
+        self.spatial_shape = None
+        self.grid_coords = None
+        self.valid_pixel_mask = None
 
-    def _extract_feature_matrix(
+    def _spatial_arrays(
         self,
-        data: Union[xr.Dataset, pd.DataFrame],
+        data: xr.Dataset,
+        target_var: Optional[str] = None,
     ) -> Tuple[np.ndarray, Optional[np.ndarray], pd.DatetimeIndex]:
-        """
-        Extract numerical feature matrix X and optional target vector y.
-        """
-        if isinstance(data, xr.Dataset):
-            times = pd.to_datetime(data["time"].values)
-            n = len(times)
 
-            # Extract or compute antecedent rainfall if missing
-            rain = data["rainfall_mm"].values if "rainfall_mm" in data else np.zeros(n)
-            sm = data["soil_moisture"].values if "soil_moisture" in data else np.full(n, 0.3)
-            temp = data["temperature_c"].values if "temperature_c" in data else np.full(n, 28.0)
+        if not isinstance(data, xr.Dataset):
+            raise TypeError("WeatherAwareLGBMModel requires an xarray Dataset.")
 
-            if "antecedent_rain_3d_mm" in data:
-                rain_3d = data["antecedent_rain_3d_mm"].values
-            else:
-                rain_3d = pd.Series(rain).rolling(3, min_periods=1).sum().values
+        times = pd.DatetimeIndex(pd.to_datetime(data["time"].values))
 
-            if "antecedent_rain_7d_mm" in data:
-                rain_7d = data["antecedent_rain_7d_mm"].values
-            else:
-                rain_7d = pd.Series(rain).rolling(7, min_periods=1).sum().values
+        if "y" not in data.dims or "x" not in data.dims:
+            raise ValueError("Dataset must contain spatial y and x dimensions.")
 
-            # Orbit encoding
-            if "orbit" in data:
-                orbit_raw = [str(o).lower() for o in data["orbit"].values]
-                orbit_enc = np.array([1 if "desc" in o else 0 for o in orbit_raw])
-            else:
-                orbit_enc = np.zeros(n)
+        height = data.sizes["y"]
+        width = data.sizes["x"]
+        n_time = len(times)
 
-            # Target
-            y = data[self.target_var].values if self.target_var in data else None
+        def get_array(name, default):
+            if name not in data:
+                return np.full(
+                    (n_time, height, width),
+                    default,
+                    dtype=np.float32,
+                )
 
+            da = data[name]
+
+            if "time" not in da.dims:
+                values = np.asarray(da.transpose("y", "x").values)
+                return np.broadcast_to(
+                    values,
+                    (n_time, height, width),
+                ).astype(np.float32)
+
+            return np.asarray(
+                da.transpose("time", "y", "x").values,
+                dtype=np.float32,
+            )
+
+        rain = get_array("rainfall_mm", 0.0)
+        soil = get_array("soil_moisture", 0.3)
+        temperature = get_array("temperature_c", 28.0)
+
+        if "antecedent_rain_3d_mm" in data:
+            rain_3d = get_array("antecedent_rain_3d_mm", 0.0)
         else:
-            # Pandas DataFrame
-            time_col = "date" if "date" in data.columns else "time"
-            times = pd.to_datetime(data[time_col].values)
-            n = len(times)
+            rain_3d = (
+                pd.Series(rain[:, 0, 0])
+                .rolling(3, min_periods=1)
+                .sum()
+                .values[:, None, None]
+            )
+            rain_3d = np.broadcast_to(rain_3d, rain.shape).copy()
 
-            rain = data["rainfall_mm"].values if "rainfall_mm" in data.columns else np.zeros(n)
-            sm = data["soil_moisture"].values if "soil_moisture" in data.columns else np.full(n, 0.3)
-            temp = data["temperature_c"].values if "temperature_c" in data.columns else np.full(n, 28.0)
+        if "antecedent_rain_7d_mm" in data:
+            rain_7d = get_array("antecedent_rain_7d_mm", 0.0)
+        else:
+            rain_7d = (
+                pd.Series(rain[:, 0, 0])
+                .rolling(7, min_periods=1)
+                .sum()
+                .values[:, None, None]
+            )
+            rain_7d = np.broadcast_to(rain_7d, rain.shape).copy()
 
-            if "antecedent_rain_3d_mm" in data.columns:
-                rain_3d = data["antecedent_rain_3d_mm"].values
-            else:
-                rain_3d = pd.Series(rain).rolling(3, min_periods=1).sum().values
+        if "orbit" in data:
+            orbit_values = np.asarray(data["orbit"].values).astype(str)
+            orbit = np.array(
+                [
+                    1.0 if "desc" in value.lower() else 0.0
+                    for value in orbit_values
+                ],
+                dtype=np.float32,
+            )
+        else:
+            orbit = np.zeros(n_time, dtype=np.float32)
 
-            if "antecedent_rain_7d_mm" in data.columns:
-                rain_7d = data["antecedent_rain_7d_mm"].values
-            else:
-                rain_7d = pd.Series(rain).rolling(7, min_periods=1).sum().values
+        doy = times.dayofyear.values.astype(np.float32)
+        months = times.month.values.astype(np.float32)
 
-            if "orbit" in data.columns:
-                orbit_raw = [str(o).lower() for o in data["orbit"].values]
-                orbit_enc = np.array([1 if "desc" in o else 0 for o in orbit_raw])
-            else:
-                orbit_enc = np.zeros(n)
-
-            y = data[self.target_var].values if self.target_var in data.columns else None
-
-        # Build cyclical and environmental feature matrix
-        doy = times.dayofyear.values.astype(float)
         sin_doy = np.sin(2.0 * np.pi * doy / 365.25)
         cos_doy = np.cos(2.0 * np.pi * doy / 365.25)
         sin_2doy = np.sin(4.0 * np.pi * doy / 365.25)
         cos_2doy = np.cos(4.0 * np.pi * doy / 365.25)
-        months = times.month.values.astype(float)
 
-        feature_cols = [
-            sin_doy, cos_doy, sin_2doy, cos_2doy, months,
-            rain, sm, temp, rain_3d, rain_7d, orbit_enc
+        y_coords = np.asarray(data["y"].values, dtype=np.float32)
+        x_coords = np.asarray(data["x"].values, dtype=np.float32)
+
+        y_normalized = (
+            (y_coords - np.mean(y_coords))
+            / max(np.std(y_coords), 1.0)
+        )
+
+        x_normalized = (
+            (x_coords - np.mean(x_coords))
+            / max(np.std(x_coords), 1.0)
+        )
+
+        y_grid = np.broadcast_to(
+            y_normalized[None, :, None],
+            (n_time, height, width),
+        )
+
+        x_grid = np.broadcast_to(
+            x_normalized[None, None, :],
+            (n_time, height, width),
+        )
+
+        water = get_array("water_mask", 0.0)
+        paddy = get_array("paddy_mask", 0.0)
+
+        orbit_grid = np.broadcast_to(
+            orbit[:, None, None],
+            rain.shape,
+        )
+
+        time_features = [
+            np.broadcast_to(feature[:, None, None], rain.shape)
+            for feature in (
+                sin_doy,
+                cos_doy,
+                sin_2doy,
+                cos_2doy,
+                months / 12.0,
+            )
         ]
-        self.feature_names = [
-            "sin_doy", "cos_doy", "sin_2doy", "cos_2doy", "month",
-            "rainfall_mm", "soil_moisture", "temperature_c",
-            "antecedent_rain_3d_mm", "antecedent_rain_7d_mm", "orbit_direction"
+
+        feature_arrays = time_features + [
+            rain,
+            soil,
+            temperature,
+            rain_3d,
+            rain_7d,
+            orbit_grid,
+            x_grid,
+            y_grid,
+            water,
+            paddy,
         ]
 
-        X = np.column_stack(feature_cols)
+        feature_names = [
+            "sin_doy",
+            "cos_doy",
+            "sin_2doy",
+            "cos_2doy",
+            "month",
+            "rainfall_mm",
+            "soil_moisture",
+            "temperature_c",
+            "antecedent_rain_3d_mm",
+            "antecedent_rain_7d_mm",
+            "orbit_direction",
+            "x_normalized",
+            "y_normalized",
+            "water_mask",
+            "paddy_mask",
+        ]
 
-        # Impute any NaNs in features with column median
-        for c in range(X.shape[1]):
-            nan_mask = np.isnan(X[:, c])
-            if np.any(nan_mask):
-                median_val = np.nanmedian(X[:, c])
-                X[nan_mask, c] = 0.0 if np.isnan(median_val) else median_val
+        X = np.stack(feature_arrays, axis=-1)
+        X = X.reshape(-1, len(feature_names))
 
-        return X, y, times
+        for column in range(X.shape[1]):
+            values = X[:, column]
+            invalid = ~np.isfinite(values)
+
+            if np.any(invalid):
+                finite = values[~invalid]
+                replacement = float(np.median(finite)) if finite.size else 0.0
+                values[invalid] = replacement
+
+        y = None
+
+        if target_var is not None and target_var in data:
+            y = np.asarray(
+                data[target_var].transpose("time", "y", "x").values,
+                dtype=np.float32,
+            ).reshape(-1)
+
+        self.feature_names = feature_names
+
+        return X.astype(np.float32), y, times
 
     def _init_regressor(self, alpha: float) -> Any:
-        """Initialize a single quantile gradient boosting regressor."""
+
         if self.use_lightgbm:
             return lgb.LGBMRegressor(
                 objective="quantile",
@@ -435,50 +584,76 @@ class WeatherAwareLGBMModel(BaseSARModel):
                 learning_rate=self.learning_rate,
                 max_depth=self.max_depth,
                 random_state=self.random_state,
-                verbose=-1,
+                verbosity=-1,
+                n_jobs=-1,
             )
-        else:
-            return HistGradientBoostingRegressor(
-                loss="quantile",
-                quantile=alpha,
-                max_iter=self.n_estimators,
-                learning_rate=self.learning_rate,
-                max_depth=self.max_depth,
-                random_state=self.random_state,
-            )
+
+        return HistGradientBoostingRegressor(
+            loss="quantile",
+            quantile=alpha,
+            max_iter=self.n_estimators,
+            learning_rate=self.learning_rate,
+            max_depth=self.max_depth,
+            random_state=self.random_state,
+        )
 
     def fit(
         self,
         data: Union[xr.Dataset, pd.DataFrame],
         target_var: str = "vv_db",
     ) -> "WeatherAwareLGBMModel":
-        """
-        Fit quantile gradient boosting models on environmental covariates.
-        """
+
+        if not isinstance(data, xr.Dataset):
+            raise TypeError("WeatherAwareLGBMModel requires an xarray Dataset.")
+
         self.target_var = target_var
-        X, y, _ = self._extract_feature_matrix(data)
+
+        X, y, _ = self._spatial_arrays(data, target_var)
 
         if y is None:
-            raise ValueError(f"Target variable '{target_var}' not found in training data.")
+            raise ValueError(f"Target variable '{target_var}' not found.")
 
-        valid = np.isfinite(y)
-        if np.sum(valid) < 10:
-            raise ValueError(f"Insufficient valid observations to train LightGBM: {np.sum(valid)} found.")
+        valid_indices = np.flatnonzero(np.isfinite(y))
 
-        X_valid = X[valid]
-        y_valid = y[valid]
+        if len(valid_indices) < 100:
+            raise ValueError("Insufficient valid spatial observations for training.")
 
-        # Fit lower quantile (e.g. 10th percentile)
+        rng = np.random.default_rng(self.random_state)
+
+        if len(valid_indices) > self.max_training_samples:
+            selected = rng.choice(
+                valid_indices,
+                size=self.max_training_samples,
+                replace=False,
+            )
+        else:
+            selected = valid_indices
+
+        X_train = X[selected]
+        y_train = y[selected]
+
         self.lower_model = self._init_regressor(self.alpha_lower)
-        self.lower_model.fit(X_valid, y_valid)
-
-        # Fit median (50th percentile)
         self.median_model = self._init_regressor(0.50)
-        self.median_model.fit(X_valid, y_valid)
-
-        # Fit upper quantile (e.g. 90th percentile)
         self.upper_model = self._init_regressor(self.alpha_upper)
-        self.upper_model.fit(X_valid, y_valid)
+
+        self.lower_model.fit(X_train, y_train)
+        self.median_model.fit(X_train, y_train)
+        self.upper_model.fit(X_train, y_train)
+
+        self.spatial_shape = (
+            data.sizes["y"],
+            data.sizes["x"],
+        )
+
+        self.grid_coords = {
+            "y": data["y"].values,
+            "x": data["x"].values,
+            "time": data["time"].values,
+        }
+
+        self.valid_pixel_mask = np.isfinite(
+            data[target_var].isel(time=0).values
+        )
 
         self.is_fitted = True
         return self
@@ -488,82 +663,126 @@ class WeatherAwareLGBMModel(BaseSARModel):
         data: Union[xr.Dataset, pd.DataFrame],
         confidence_level: float = 0.90,
     ) -> xr.Dataset:
-        """
-        Predict expected radar backscatter conditioned on weather, season, and geography.
 
-        Returns quantile intervals [lower_bound_db, upper_bound_db] and estimated std.
-        """
         if not self.is_fitted:
-            raise RuntimeError("WeatherAwareLGBMModel must be fitted before predict() is called.")
+            raise RuntimeError("WeatherAwareLGBMModel must be fitted first.")
 
-        X, y_obs, times = self._extract_feature_matrix(data)
+        if not isinstance(data, xr.Dataset):
+            raise TypeError("Prediction requires an xarray Dataset.")
 
-        # Generate quantile predictions
-        lower_pred = self.lower_model.predict(X)
-        median_pred = self.median_model.predict(X)
-        upper_pred = self.upper_model.predict(X)
+        if not 0 < confidence_level < 1:
+            raise ValueError("confidence_level must be between 0 and 1.")
 
-        # Enforce physical monotonicity: lower <= median <= upper
-        lower_bound = np.minimum(lower_pred, median_pred)
-        upper_bound = np.maximum(upper_pred, median_pred)
+        if (
+            data.sizes["y"],
+            data.sizes["x"],
+        ) != self.spatial_shape:
+            raise ValueError("Prediction grid does not match training grid.")
 
-        # Estimate equivalent standard deviation from inter-quantile spread:
-        # For standard normal, IQR(0.10 to 0.90) = 2 * 1.28155 * std
-        z_equiv = 1.28155
-        est_std = np.maximum((upper_bound - lower_bound) / (2.0 * z_equiv), 0.3)
+        X, y_obs, times = self._spatial_arrays(data, self.target_var)
 
-        is_synth = 0
-        if isinstance(data, xr.Dataset):
-            coords = {"time": data["time"].values}
-            is_synth = int(data.attrs.get("is_synthetic", 0))
-        else:
-            time_col = "date" if "date" in data.columns else "time"
-            coords = {"time": pd.to_datetime(data[time_col].values)}
-            is_synth = int(data.get("is_synthetic", False).any() if "is_synthetic" in data else 0)
+        total = len(X)
+
+        lower = np.empty(total, dtype=np.float32)
+        median = np.empty(total, dtype=np.float32)
+        upper = np.empty(total, dtype=np.float32)
+
+        for start in range(0, total, self.prediction_batch_size):
+            end = min(start + self.prediction_batch_size, total)
+            batch = X[start:end]
+
+            lower[start:end] = self.lower_model.predict(batch)
+            median[start:end] = self.median_model.predict(batch)
+            upper[start:end] = self.upper_model.predict(batch)
+
+        lower = np.minimum(lower, median)
+        upper = np.maximum(upper, median)
+
+        std = np.maximum(
+            (upper - lower) / (2.0 * 1.28155),
+            0.3,
+        )
+
+        n_time = len(times)
+        height, width = self.spatial_shape
+        shape = (n_time, height, width)
+
+        median = median.reshape(shape)
+        lower = lower.reshape(shape)
+        upper = upper.reshape(shape)
+        std = std.reshape(shape)
+
+        valid_mask = np.broadcast_to(
+            self.valid_pixel_mask,
+            shape,
+        )
+
+        median[~valid_mask] = np.nan
+        lower[~valid_mask] = np.nan
+        upper[~valid_mask] = np.nan
+        std[~valid_mask] = np.nan
 
         data_vars = {
             "predicted_backscatter_db": (
-                "time", median_pred,
-                {"units": "dB", "long_name": "Weather-Aware Expected Backscatter (Median)"}
+                ("time", "y", "x"),
+                median,
+                {"units": "dB"},
             ),
             "prediction_std": (
-                "time", est_std,
-                {"units": "dB", "long_name": "Quantile-Estimated Standard Deviation"}
+                ("time", "y", "x"),
+                std,
+                {"units": "dB"},
             ),
             "lower_bound_db": (
-                "time", lower_bound,
-                {"units": "dB", "long_name": f"{int(self.alpha_lower*100)}th Percentile Lower Bound"}
+                ("time", "y", "x"),
+                lower,
+                {"units": "dB"},
             ),
             "upper_bound_db": (
-                "time", upper_bound,
-                {"units": "dB", "long_name": f"{int(self.alpha_upper*100)}th Percentile Upper Bound"}
+                ("time", "y", "x"),
+                upper,
+                {"units": "dB"},
             ),
         }
 
         if y_obs is not None:
-            residuals = y_obs - median_pred
-            data_vars["observed_backscatter_db"] = ("time", y_obs, {"units": "dB"})
-            data_vars["residual_db"] = (
-                "time", residuals,
-                {"units": "dB", "long_name": "Residual (Observed − Weather Expected)"}
+            observed = y_obs.reshape(shape)
+            residual = observed - median
+
+            data_vars["observed_backscatter_db"] = (
+                ("time", "y", "x"),
+                observed,
+                {"units": "dB"},
             )
 
-        out_ds = xr.Dataset(data_vars=data_vars, coords=coords)
-        out_ds.attrs["model_name"] = self.model_name
-        out_ds.attrs["engine"] = "LightGBM" if self.use_lightgbm else "HistGradientBoosting"
-        out_ds.attrs["quantile_lower"] = self.alpha_lower
-        out_ds.attrs["quantile_upper"] = self.alpha_upper
-        out_ds.attrs["is_synthetic"] = is_synth
-        out_ds.attrs["notice"] = (
-            "⚠️ SYNTHETIC EVALUATION — Synthetic observations must not be used as evidence of real-world performance"
-            if is_synth else "Weather-Aware Quantile Regression Prediction"
+            data_vars["residual_db"] = (
+                ("time", "y", "x"),
+                residual,
+                {"units": "dB"},
+            )
+
+        out = xr.Dataset(
+            data_vars=data_vars,
+            coords={
+                "time": data["time"].values,
+                "y": data["y"].values,
+                "x": data["x"].values,
+            },
         )
-        return out_ds
 
+        out.attrs.update(data.attrs)
+        out.attrs["model_name"] = self.model_name
+        out.attrs["engine"] = (
+            "LightGBM" if self.use_lightgbm else "HistGradientBoosting"
+        )
+        out.attrs["quantile_lower"] = self.alpha_lower
+        out.attrs["quantile_upper"] = self.alpha_upper
+        out.attrs["is_synthetic"] = bool(data.attrs.get("is_synthetic", False))
+        out.attrs["spatial_prediction"] = True
+        out.attrs["training_sample_limit"] = self.max_training_samples
 
-# ════════════════════════════════════════════════════════════════════════
-#  3. MODEL EVALUATION & SCIENTIFIC RESIDUAL DIAGNOSTICS
-# ════════════════════════════════════════════════════════════════════════
+        return out
+
 
 def evaluate_model_performance(
     observed: np.ndarray,
@@ -571,64 +790,85 @@ def evaluate_model_performance(
     lower_bound: Optional[np.ndarray] = None,
     upper_bound: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
-    """
-    Compute regression error metrics and uncertainty interval coverage.
 
-    Scientific Interpretation:
-      - Normal radar speckle & seasonal moisture fluctuations generate typical residuals
-        of ±1.0 to 1.8 dB. Small residuals do NOT constitute anomalies.
-      - A good model exhibits ~80-90% coverage within the [10th, 90th] quantile bounds.
-    """
+    observed = np.asarray(observed)
+    predicted = np.asarray(predicted)
+
+    if observed.shape != predicted.shape:
+        raise ValueError("Observed and predicted arrays must have matching shapes.")
+
     valid = np.isfinite(observed) & np.isfinite(predicted)
-    if np.sum(valid) == 0:
-        return {"mae": np.nan, "rmse": np.nan, "r2": np.nan, "coverage_pct": np.nan}
 
-    y_t = observed[valid]
-    y_p = predicted[valid]
+    if not np.any(valid):
+        return {
+            "mae_db": np.nan,
+            "rmse_db": np.nan,
+            "r2_score": np.nan,
+            "interval_coverage_pct": np.nan,
+            "valid_samples": 0,
+        }
 
-    mae = float(mean_absolute_error(y_t, y_p))
-    rmse = float(np.sqrt(mean_squared_error(y_t, y_p)))
-    r2 = float(r2_score(y_t, y_p))
+    y_true = observed[valid]
+    y_pred = predicted[valid]
 
-    coverage_pct = np.nan
+    mae = float(mean_absolute_error(y_true, y_pred))
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+    r2 = (
+        float(r2_score(y_true, y_pred))
+        if len(y_true) > 1
+        else np.nan
+    )
+
+    coverage = np.nan
+
     if lower_bound is not None and upper_bound is not None:
-        lb = lower_bound[valid]
-        ub = upper_bound[valid]
-        inside = (y_t >= lb) & (y_t <= ub)
-        coverage_pct = float(np.mean(inside) * 100.0)
+        lower_bound = np.asarray(lower_bound)
+        upper_bound = np.asarray(upper_bound)
+
+        if lower_bound.shape != observed.shape or upper_bound.shape != observed.shape:
+            raise ValueError("Uncertainty bounds must match the observed array shape.")
+
+        valid_interval = (
+            valid
+            & np.isfinite(lower_bound)
+            & np.isfinite(upper_bound)
+        )
+
+        if np.any(valid_interval):
+            inside = (
+                (observed[valid_interval] >= lower_bound[valid_interval])
+                & (observed[valid_interval] <= upper_bound[valid_interval])
+            )
+
+            coverage = float(np.mean(inside) * 100.0)
 
     return {
         "mae_db": round(mae, 3),
         "rmse_db": round(rmse, 3),
-        "r2_score": round(r2, 3),
-        "interval_coverage_pct": round(coverage_pct, 1),
+        "r2_score": round(r2, 3) if np.isfinite(r2) else np.nan,
+        "interval_coverage_pct": round(coverage, 1) if np.isfinite(coverage) else np.nan,
+        "valid_samples": int(len(y_true)),
     }
 
 
-# ════════════════════════════════════════════════════════════════════════
-#  4. REPRODUCIBLE DEMONSTRATION (Synthetic Pipeline Test)
-# ════════════════════════════════════════════════════════════════════════
-
 def run_stage3_demo() -> Dict[str, Any]:
-    """
-    Demonstrate both Seasonal Climatology and Weather-Aware LightGBM models
-    on synthetic test data.
 
-    Returns performance metrics comparison dict.
-    """
-    from src.data_source import create_synthetic_datacube
+    from app.mock_data import generate_spatial_datacube
 
-    # 1. Ingest synthetic data cube from Stage 2 data loader
-    cube = create_synthetic_datacube(
-        start_date=DEFAULT_START_DATE,
-        end_date=DEFAULT_END_DATE,
+    cube = generate_spatial_datacube()
+
+    train_slice = cube.sel(
+        time=slice("2023-01-01", "2023-12-31")
     )
 
-    # 2. Train/Test split: 2023 for training, early 2024 for testing
-    train_slice = cube.sel(time=slice("2023-01-01", "2023-12-31"))
-    test_slice = cube.sel(time=slice("2024-01-01", "2024-06-30"))
+    test_slice = cube.sel(
+        time=slice("2024-01-01", "2024-06-30")
+    )
 
-    # 3. Model 1: Seasonal Climatology Baseline
+    if train_slice.sizes["time"] < 5 or test_slice.sizes["time"] < 1:
+        raise ValueError("Insufficient training or testing dates.")
+
     climatology = SeasonalClimatologyModel(num_harmonics=2)
     climatology.fit(train_slice, target_var="vv_db")
     clim_pred = climatology.predict(test_slice)
@@ -640,13 +880,14 @@ def run_stage3_demo() -> Dict[str, Any]:
         upper_bound=clim_pred["upper_bound_db"].values,
     )
 
-    # 4. Model 2: Weather-Aware LightGBM
     weather_model = WeatherAwareLGBMModel(
         alpha_lower=0.10,
         alpha_upper=0.90,
         n_estimators=60,
         learning_rate=0.08,
+        max_training_samples=100000,
     )
+
     weather_model.fit(train_slice, target_var="vv_db")
     weather_pred = weather_model.predict(test_slice)
 
@@ -663,5 +904,8 @@ def run_stage3_demo() -> Dict[str, Any]:
         "climatology_predictions": clim_pred,
         "weather_predictions": weather_pred,
         "is_synthetic": True,
-        "notice": "⚠️ NOTE: Evaluated on synthetic demonstration data. Synthetic observations must not be used as evidence of real-world model performance.",
+        "notice": (
+            "Synthetic demonstration only. "
+            "These metrics do not establish real-world model performance."
+        ),
     }

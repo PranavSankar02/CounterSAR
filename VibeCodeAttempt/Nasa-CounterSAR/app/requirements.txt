@@ -19,3 +19,5 @@ streamlit-folium>=0.15.0
 # ─── Machine Learning (Stage 2+) ──────────────────────────────────────
 lightgbm>=4.1.0
 scikit-learn>=1.3.0
+pyproj>=3.6.0
+rasterio>=1.3.9
