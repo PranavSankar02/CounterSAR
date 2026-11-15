@@ -1,47 +1,5 @@
-"""
-CounterSAR — Anomaly Scoring and Persistence Filtering (Stage 4)
-=================================================================
-Distinguishes expected seasonal patterns and weather-explained events from
-genuinely unexplained satellite radar anomalies.
-
-Pipeline Logic:
-  1. Z-Score Computation with Uncertainty:
-     - Climatological Z-Score: (Observed − Seasonal Expected) / σ_clim
-     - Weather-Aware Z-Score:  (Observed − Weather Expected) / σ_weather
-     - Uses local/temporal model uncertainty rather than a static global scalar.
-
-  2. Adaptive Anomaly Thresholds:
-     - Automatically expands during the South-West and North-East monsoon
-       windows to account for natural precipitation variance and elevated speckle.
-
-  3. Three-Category Verdict Generation:
-     - 'Expected':
-       Observed backscatter matches both seasonal climatology and weather expectations.
-     - 'Unusual but Explained':
-       Observed backscatter deviates from historical seasonal norms, but is fully
-       consistent with known weather drivers (e.g. heavy rainfall or soil saturation).
-     - 'Unexplained Candidate Event':
-       Observed backscatter diverges significantly from BOTH seasonal expectation
-       and weather-aware predictions, indicating an unexplained physical process.
-
-  4. Physical Deviation Classification:
-     - Does NOT classify every negative drop as a "flood" (can be planned irrigation,
-       soil wetting, or specular water pooling).
-     - Does NOT ignore positive jumps (can be emergent vegetation double-bounce
-       or surface structural changes).
-
-  5. Temporal Persistence Filtering:
-     - Confirms whether an anomaly persists across consecutive satellite acquisitions
-       (≥ 2 passes, e.g. ≥ 24 days in Sentinel-1 12-day revisit cycles).
-     - Rejects single-pass transient speckle, antenna artifacts, or temporary puddles.
-
-  6. NetCDF Pipeline Output:
-     - Exports a CF-compliant NetCDF cube to results/pipeline_output.nc.
-"""
-
 from __future__ import annotations
 
-import os
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -50,23 +8,11 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from src.skeleton import (
-    CRS,
-    KUTTANAD_BOUNDS,
-    AnomalyResult,
-)
-from src.models import (
-    SeasonalClimatologyModel,
-    WeatherAwareLGBMModel,
-)
+from src.skeleton import CRS, KUTTANAD_BOUNDS, AnomalyResult
+from src.models import SeasonalClimatologyModel, WeatherAwareLGBMModel
 
-
-# ════════════════════════════════════════════════════════════════════════
-#  VERDICT ENUMS & CONSTANTS
-# ════════════════════════════════════════════════════════════════════════
 
 class AnomalyVerdict(str, Enum):
-    """Three-category pipeline verdict."""
     EXPECTED = "Expected"
     UNUSUAL_EXPLAINED = "Unusual but Explained"
     UNEXPLAINED_CANDIDATE = "Unexplained Candidate Event"
@@ -83,170 +29,120 @@ VERDICT_CODE_MAP = {
 CODE_TO_VERDICT_MAP = {v: k for k, v in VERDICT_CODE_MAP.items()}
 
 
-# ════════════════════════════════════════════════════════════════════════
-#  1. Z-SCORE CALCULATION WITH PREDICTION UNCERTAINTY
-# ════════════════════════════════════════════════════════════════════════
-
 def calculate_z_scores(
     observed: np.ndarray,
     predicted: np.ndarray,
     uncertainty_std: np.ndarray,
     min_noise_floor_db: float = 0.5,
 ) -> np.ndarray:
-    """
-    Calculate standardized Z-scores normalized by prediction uncertainty:
-        Z = (Observed − Predicted) / max(σ_pred, σ_min)
+    if min_noise_floor_db <= 0:
+        raise ValueError("min_noise_floor_db must be positive")
 
-    Parameters
-    ----------
-    observed : np.ndarray
-        Observed radar backscatter values in dB.
-    predicted : np.ndarray
-        Model-predicted expected backscatter in dB.
-    uncertainty_std : np.ndarray
-        Model-estimated prediction standard deviation in dB.
-    min_noise_floor_db : float
-        Noise floor to prevent division by near-zero variance.
+    obs, pred, std = np.broadcast_arrays(
+        np.asarray(observed, dtype=float),
+        np.asarray(predicted, dtype=float),
+        np.asarray(uncertainty_std, dtype=float),
+    )
 
-    Returns
-    -------
-    np.ndarray
-        Z-scores with NaNs preserved where inputs are invalid.
-    """
-    obs_arr = np.asarray(observed, dtype=float)
-    pred_arr = np.asarray(predicted, dtype=float)
-    std_arr = np.asarray(uncertainty_std, dtype=float)
+    valid = (
+        np.isfinite(obs)
+        & np.isfinite(pred)
+        & np.isfinite(std)
+        & (std >= 0)
+    )
 
-    safe_std = np.maximum(std_arr, min_noise_floor_db)
-    valid_mask = np.isfinite(obs_arr) & np.isfinite(pred_arr) & np.isfinite(safe_std)
+    result = np.full(obs.shape, np.nan, dtype=float)
 
-    z_scores = np.full_like(obs_arr, np.nan, dtype=float)
-    z_scores[valid_mask] = (obs_arr[valid_mask] - pred_arr[valid_mask]) / safe_std[valid_mask]
-    return z_scores
+    safe_std = np.maximum(std, min_noise_floor_db)
+    result[valid] = (obs[valid] - pred[valid]) / safe_std[valid]
 
+    return result
 
-# ════════════════════════════════════════════════════════════════════════
-#  2. ADAPTIVE ANOMALY THRESHOLDS
-# ════════════════════════════════════════════════════════════════════════
 
 def calculate_adaptive_threshold(
     times: pd.DatetimeIndex,
     base_threshold: float = 2.0,
     monsoon_scale: float = 1.25,
 ) -> np.ndarray:
-    """
-    Compute time-varying adaptive anomaly thresholds.
+    if base_threshold <= 0:
+        raise ValueError("base_threshold must be positive")
 
-    In Kuttanad, the South-West Monsoon (June to September, DOY ~152..273)
-    and North-East Monsoon (October to November, DOY ~274..334) produce
-    dramatically higher natural environmental and speckle variance.
-    The threshold adaptively expands during monsoon periods to prevent
-    spurious false alarms, while tightening during stable dry months.
+    if monsoon_scale < 1:
+        raise ValueError("monsoon_scale must be at least 1")
 
-    Parameters
-    ----------
-    times : pd.DatetimeIndex
-        Timestamps of satellite acquisitions.
-    base_threshold : float
-        Baseline standard deviation threshold (default: 2.0).
-    monsoon_scale : float
-        Multiplier during high-variance monsoon months (default: 1.25 -> Z=2.50).
+    times = pd.DatetimeIndex(times)
+    doy = times.dayofyear.values
 
-    Returns
-    -------
-    np.ndarray
-        Threshold vector matching `times`.
-    """
-    doy = times.dayofyear.values.astype(float)
     thresholds = np.full(len(times), base_threshold, dtype=float)
 
-    # South-West Monsoon (Jun–Sep: DOY 152 to 273)
     sw_mask = (doy >= 152) & (doy <= 273)
-    thresholds[sw_mask] = base_threshold * monsoon_scale
-
-    # North-East Monsoon (Oct–Nov: DOY 274 to 334)
     ne_mask = (doy >= 274) & (doy <= 334)
-    thresholds[ne_mask] = base_threshold * (1.0 + 0.5 * (monsoon_scale - 1.0))
+
+    thresholds[sw_mask] = base_threshold * monsoon_scale
+    thresholds[ne_mask] = base_threshold * (
+        1.0 + 0.5 * (monsoon_scale - 1.0)
+    )
 
     return thresholds
 
-
-# ════════════════════════════════════════════════════════════════════════
-#  3. PERSISTENCE FILTERING
-# ════════════════════════════════════════════════════════════════════════
 
 def apply_persistence_filter(
     candidate_mask: np.ndarray,
     min_consecutive_passes: int = 2,
     sign_array: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """
-    Multi-pass persistence filtering across consecutive acquisitions.
+    candidates = np.asarray(candidate_mask, dtype=bool)
 
-    An anomaly candidate at timestep t is confirmed as persistent if:
-      - It persists across ≥ `min_consecutive_passes` consecutive acquisitions.
-      - If `sign_array` is provided, consecutive anomalies must share the same
-        physical sign (e.g. continuous negative drop or continuous positive jump).
+    if candidates.ndim < 1:
+        raise ValueError("candidate_mask must have at least one dimension")
 
-    Filters out transient radar speckle, radio frequency interference (RFI),
-    and ephemeral surface puddles that vanish within hours.
+    if min_consecutive_passes < 1:
+        raise ValueError("min_consecutive_passes must be at least 1")
 
-    Parameters
-    ----------
-    candidate_mask : np.ndarray of bool
-        Boolean array indicating candidate anomaly detections.
-    min_consecutive_passes : int
-        Minimum consecutive passes required (default: 2).
-    sign_array : np.ndarray, optional
-        Sign indicator (+1 for positive jump, -1 for negative drop).
+    if candidates.shape[0] == 0:
+        return np.zeros_like(candidates, dtype=bool)
 
-    Returns
-    -------
-    np.ndarray of bool
-        Boolean mask of confirmed persistent anomalies.
-    """
-    n = len(candidate_mask)
-    if n == 0:
-        return np.array([], dtype=bool)
+    if min_consecutive_passes == 1:
+        return candidates.copy()
 
-    persistent_mask = np.zeros(n, dtype=bool)
+    if sign_array is not None:
+        signs = np.broadcast_to(
+            np.asarray(sign_array, dtype=float),
+            candidates.shape,
+        )
+        signs = np.sign(signs)
+    else:
+        signs = None
 
-    if min_consecutive_passes <= 1:
-        return np.copy(candidate_mask)
+    persistent = np.zeros_like(candidates, dtype=bool)
+    n_times = candidates.shape[0]
 
-    for i in range(n):
-        if not candidate_mask[i]:
-            continue
+    if min_consecutive_passes > n_times:
+        return persistent
 
-        # Look backwards and forwards to count consecutive active runs
-        run_length = 1
-        current_sign = sign_array[i] if sign_array is not None else 0
+    for start in range(n_times - min_consecutive_passes + 1):
+        end = start + min_consecutive_passes
+        window = candidates[start:end]
 
-        # Check backwards
-        j = i - 1
-        while j >= 0 and candidate_mask[j]:
-            if sign_array is not None and np.sign(sign_array[j]) != np.sign(current_sign):
-                break
-            run_length += 1
-            j -= 1
+        valid_run = np.all(window, axis=0)
 
-        # Check forwards
-        j = i + 1
-        while j < n and candidate_mask[j]:
-            if sign_array is not None and np.sign(sign_array[j]) != np.sign(current_sign):
-                break
-            run_length += 1
-            j += 1
+        if signs is not None:
+            sign_window = signs[start:end]
+            first_sign = sign_window[0]
 
-        if run_length >= min_consecutive_passes:
-            persistent_mask[i] = True
+            same_sign = np.all(
+                sign_window == first_sign[None, ...],
+                axis=0,
+            )
 
-    return persistent_mask
+            nonzero_sign = first_sign != 0
+            valid_run &= same_sign & nonzero_sign
 
+        for index in range(start, end):
+            persistent[index] |= valid_run
 
-# ════════════════════════════════════════════════════════════════════════
-#  4. THREE-CATEGORY VERDICT GENERATION
-# ════════════════════════════════════════════════════════════════════════
+    return persistent
+
 
 def generate_three_category_verdicts(
     z_clim: np.ndarray,
@@ -256,111 +152,138 @@ def generate_three_category_verdicts(
     weather_pred: np.ndarray,
     min_valid_obs: int = 5,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Generate three-category verdicts by contrasting seasonal climatology
-    with weather-aware predictions:
+    zc, zw, obs, weather = np.broadcast_arrays(
+        np.asarray(z_clim, dtype=float),
+        np.asarray(z_weather, dtype=float),
+        np.asarray(observed, dtype=float),
+        np.asarray(weather_pred, dtype=float),
+    )
 
-      1. 'Expected' (Code 0):
-         |Z_clim| ≤ T and |Z_weather| ≤ T
-         Observed radar values align with normal seasonal expectation and weather.
+    if zc.ndim < 1:
+        raise ValueError("Inputs must have a time dimension")
 
-      2. 'Unusual but Explained' (Code 1):
-         |Z_clim| > T, but |Z_weather| ≤ T
-         Observed values deviate from normal seasonal climatology, but are fully
-         explained by known meteorological drivers (rainfall, soil moisture, etc.).
+    thresholds = np.asarray(thresholds, dtype=float)
 
-      3. 'Unexplained Candidate Event' (Code 2):
-         |Z_weather| > T (and typically |Z_clim| > T)
-         Observed values diverge from BOTH seasonal climatology and the weather-aware
-         prediction. Weather cannot account for the deviation.
+    if thresholds.ndim == 1:
+        if len(thresholds) != zc.shape[0]:
+            raise ValueError("Threshold count must match the time dimension")
 
-    Returns
-    -------
-    verdict_strings : np.ndarray of str
-    verdict_codes : np.ndarray of int (0, 1, 2, or -1 for insufficient data)
-    candidate_mask : np.ndarray of bool (True where verdict is Unexplained Candidate)
-    """
-    n = len(z_clim)
-    verdict_strings = np.full(n, AnomalyVerdict.EXPECTED.value, dtype=object)
-    verdict_codes = np.zeros(n, dtype=int)
-    candidate_mask = np.zeros(n, dtype=bool)
+        thresholds = thresholds.reshape(
+            (len(thresholds),) + (1,) * (zc.ndim - 1)
+        )
 
-    # Check for insufficient observations
-    valid_count = np.sum(np.isfinite(observed))
-    if valid_count < min_valid_obs:
-        verdict_strings[:] = AnomalyVerdict.INSUFFICIENT_DATA.value
-        verdict_codes[:] = VERDICT_CODE_MAP[AnomalyVerdict.INSUFFICIENT_DATA.value]
-        return verdict_strings, verdict_codes, candidate_mask
+    thresholds = np.broadcast_to(thresholds, zc.shape)
 
-    for i in range(n):
-        zc = z_clim[i]
-        zw = z_weather[i]
-        t = thresholds[i]
+    verdict_codes = np.full(zc.shape, -1, dtype=np.int8)
+    candidate_mask = np.zeros(zc.shape, dtype=bool)
 
-        if not (np.isfinite(zc) and np.isfinite(zw)):
-            verdict_strings[i] = AnomalyVerdict.INSUFFICIENT_DATA.value
-            verdict_codes[i] = VERDICT_CODE_MAP[AnomalyVerdict.INSUFFICIENT_DATA.value]
-            continue
+    valid = (
+        np.isfinite(zc)
+        & np.isfinite(zw)
+        & np.isfinite(obs)
+        & np.isfinite(weather)
+        & np.isfinite(thresholds)
+    )
 
-        abs_zc = abs(zc)
-        abs_zw = abs(zw)
+    valid_count = np.sum(np.isfinite(obs), axis=0)
+    sufficient_data = valid_count >= min_valid_obs
 
-        if abs_zw > t:
-            # Weather model cannot explain the departure
-            verdict_strings[i] = AnomalyVerdict.UNEXPLAINED_CANDIDATE.value
-            verdict_codes[i] = VERDICT_CODE_MAP[AnomalyVerdict.UNEXPLAINED_CANDIDATE.value]
-            candidate_mask[i] = True
-        elif abs_zc > t and abs_zw <= t:
-            # Climatology was surprised, but weather model explained it!
-            verdict_strings[i] = AnomalyVerdict.UNUSUAL_EXPLAINED.value
-            verdict_codes[i] = VERDICT_CODE_MAP[AnomalyVerdict.UNUSUAL_EXPLAINED.value]
-        else:
-            # Within normal bounds for both
-            verdict_strings[i] = AnomalyVerdict.EXPECTED.value
-            verdict_codes[i] = VERDICT_CODE_MAP[AnomalyVerdict.EXPECTED.value]
+    sufficient_mask = np.broadcast_to(
+        sufficient_data,
+        zc.shape,
+    )
+
+    valid &= sufficient_mask
+
+    expected = valid & (np.abs(zc) <= thresholds) & (
+        np.abs(zw) <= thresholds
+    )
+
+    explained = valid & (np.abs(zc) > thresholds) & (
+        np.abs(zw) <= thresholds
+    )
+
+    unexplained = valid & (np.abs(zw) > thresholds)
+
+    verdict_codes[expected] = VERDICT_CODE_MAP[
+        AnomalyVerdict.EXPECTED.value
+    ]
+
+    verdict_codes[explained] = VERDICT_CODE_MAP[
+        AnomalyVerdict.UNUSUAL_EXPLAINED.value
+    ]
+
+    verdict_codes[unexplained] = VERDICT_CODE_MAP[
+        AnomalyVerdict.UNEXPLAINED_CANDIDATE.value
+    ]
+
+    candidate_mask[unexplained] = True
+
+    verdict_strings = np.full(
+        zc.shape,
+        AnomalyVerdict.INSUFFICIENT_DATA.value,
+        dtype="<U32",
+    )
+
+    for code, label in CODE_TO_VERDICT_MAP.items():
+        verdict_strings[verdict_codes == code] = label
 
     return verdict_strings, verdict_codes, candidate_mask
 
-
-# ════════════════════════════════════════════════════════════════════════
-#  5. PHYSICAL DEVIATION CLASSIFICATION
-# ════════════════════════════════════════════════════════════════════════
 
 def classify_deviation_nature(
     residual_db: np.ndarray,
     candidate_mask: np.ndarray,
 ) -> np.ndarray:
-    """
-    Classify the physical direction/character of the radar departure.
+    residual, candidates = np.broadcast_arrays(
+        np.asarray(residual_db, dtype=float),
+        np.asarray(candidate_mask, dtype=bool),
+    )
 
-    Scientific Principle:
-      - Do NOT classify every negative drop as a "flood" (can be planned irrigation
-        or soil wetting).
-      - Do NOT ignore positive jumps (can be emergent vegetation double-bounce
-        or structural changes).
+    nature = np.full(
+        residual.shape,
+        "expected_variation",
+        dtype="<U40",
+    )
 
-    Categories:
-      - 'unexplained_backscatter_drop' (Negative departure: specular water, inundation, saturation)
-      - 'unexplained_backscatter_jump' (Positive departure: double-bounce, surface roughness, emergent canopy)
-      - 'expected_variation'          (Normal behavior within uncertainty bounds)
-    """
-    n = len(residual_db)
-    nature = np.full(n, "expected_variation", dtype=object)
+    drop = candidates & np.isfinite(residual) & (residual < 0)
+    jump = candidates & np.isfinite(residual) & (residual > 0)
 
-    for i in range(n):
-        if not candidate_mask[i] or np.isnan(residual_db[i]):
-            continue
-        if residual_db[i] < 0:
-            nature[i] = "unexplained_backscatter_drop"
-        else:
-            nature[i] = "unexplained_backscatter_jump"
+    nature[drop] = "unexplained_backscatter_drop"
+    nature[jump] = "unexplained_backscatter_jump"
 
     return nature
 
 
-# ════════════════════════════════════════════════════════════════════════
-#  6. END-TO-END ANOMALY DETECTION PIPELINE
-# ════════════════════════════════════════════════════════════════════════
+def _get_model_array(
+    prediction: xr.Dataset,
+    variable: str,
+    reference: xr.DataArray,
+) -> np.ndarray:
+    if variable not in prediction:
+        raise KeyError(f"Model output is missing '{variable}'")
+
+    array = prediction[variable]
+
+    if not isinstance(array, xr.DataArray):
+        raise TypeError(f"'{variable}' must be an xarray DataArray")
+
+    array = array.broadcast_like(reference).transpose(*reference.dims)
+
+    return np.asarray(array.values, dtype=float)
+
+
+def _get_spatial_coordinates(
+    data: xr.Dataset,
+) -> Dict[str, Any]:
+    coordinates = {}
+
+    for name in ("time", "y", "x"):
+        if name in data.coords:
+            coordinates[name] = data.coords[name]
+
+    return coordinates
+
 
 def run_anomaly_pipeline(
     data: Union[xr.Dataset, pd.DataFrame],
@@ -371,194 +294,228 @@ def run_anomaly_pipeline(
     min_consecutive_passes: int = 2,
     output_netcdf_path: Optional[Union[str, Path]] = "results/pipeline_output.nc",
 ) -> xr.Dataset:
-    """
-    Execute the full CounterSAR anomaly detection and persistence filtering pipeline.
+    if not isinstance(data, xr.Dataset):
+        raise TypeError(
+            "The spatial anomaly pipeline currently requires an xarray Dataset"
+        )
 
-    Workflow:
-      1. Prepares seasonal climatology and weather-aware predictions.
-      2. Computes uncertainty-normalized Z-scores for both models.
-      3. Calculates adaptive seasonal thresholds.
-      4. Assigns the 3-category verdict ('Expected', 'Unusual but Explained', 'Unexplained Candidate').
-      5. Runs temporal persistence filtering across consecutive acquisitions.
-      6. Formats output as a rich, CF-compliant NetCDF Dataset and exports to disk.
+    if target_var not in data:
+        raise KeyError(f"Target variable '{target_var}' not found")
 
-    Parameters
-    ----------
-    data : xr.Dataset or pd.DataFrame
-        Aligned satellite & environmental data (from src/data_source.py).
-    target_var : str
-        Target backscatter variable (default: 'vv_db').
-    climatology_model : SeasonalClimatologyModel, optional
-        Pre-fitted or new climatology model.
-    weather_model : WeatherAwareLGBMModel, optional
-        Pre-fitted or new weather-aware model.
-    base_threshold : float
-        Adaptive baseline threshold in Z-score units (default: 2.0).
-    min_consecutive_passes : int
-        Minimum consecutive passes for persistence confirmation (default: 2).
-    output_netcdf_path : str or Path, optional
-        Destination path for pipeline output (default: 'results/pipeline_output.nc').
+    if "time" not in data[target_var].dims:
+        raise ValueError("Target variable must contain a time dimension")
 
-    Returns
-    -------
-    xr.Dataset
-        Complete pipeline output dataset containing verdicts, scores, and bounds.
-    """
-    # 1. Fit models if not provided
+    reference = data[target_var]
+    times = pd.DatetimeIndex(pd.to_datetime(data.time.values))
+
     if climatology_model is None or not climatology_model.is_fitted:
         climatology_model = SeasonalClimatologyModel(num_harmonics=2)
         climatology_model.fit(data, target_var=target_var)
 
     if weather_model is None or not weather_model.is_fitted:
-        weather_model = WeatherAwareLGBMModel(alpha_lower=0.10, alpha_upper=0.90)
+        weather_model = WeatherAwareLGBMModel(
+            alpha_lower=0.10,
+            alpha_upper=0.90,
+        )
         weather_model.fit(data, target_var=target_var)
 
-    # 2. Generate predictions from both models
     clim_pred = climatology_model.predict(data)
     weather_pred = weather_model.predict(data)
 
-    # Extract arrays
-    if isinstance(data, xr.Dataset):
-        times = pd.to_datetime(data["time"].values)
-        obs_db = data[target_var].values
-        is_synth = int(data.attrs.get("is_synthetic", 0))
-    else:
-        time_col = "date" if "date" in data.columns else "time"
-        times = pd.to_datetime(data[time_col].values)
-        obs_db = data[target_var].values
-        is_synth = int(data.get("is_synthetic", False).any() if "is_synthetic" in data else 0)
+    obs = np.asarray(reference.values, dtype=float)
 
-    y_clim = clim_pred["predicted_backscatter_db"].values
-    std_clim = clim_pred["prediction_std"].values
-
-    y_weather = weather_pred["predicted_backscatter_db"].values
-    std_weather = weather_pred["prediction_std"].values
-
-    # 3. Compute uncertainty-aware Z-scores
-    z_clim = calculate_z_scores(obs_db, y_clim, std_clim)
-    z_weather = calculate_z_scores(obs_db, y_weather, std_weather)
-
-    # 4. Adaptive thresholds
-    thresholds = calculate_adaptive_threshold(times, base_threshold=base_threshold)
-
-    # 5. Generate 3-category verdicts
-    verdict_strings, verdict_codes, candidate_mask = generate_three_category_verdicts(
-        z_clim=z_clim,
-        z_weather=z_weather,
-        thresholds=thresholds,
-        observed=obs_db,
-        weather_pred=y_weather,
+    y_clim = _get_model_array(
+        clim_pred,
+        "predicted_backscatter_db",
+        reference,
     )
 
-    # 6. Physical deviation nature & Persistence filtering
-    residual_weather = obs_db - y_weather
-    deviation_nature = classify_deviation_nature(residual_weather, candidate_mask)
+    std_clim = _get_model_array(
+        clim_pred,
+        "prediction_std",
+        reference,
+    )
 
-    sign_array = np.sign(residual_weather)
+    y_weather = _get_model_array(
+        weather_pred,
+        "predicted_backscatter_db",
+        reference,
+    )
+
+    std_weather = _get_model_array(
+        weather_pred,
+        "prediction_std",
+        reference,
+    )
+
+    z_clim = calculate_z_scores(obs, y_clim, std_clim)
+    z_weather = calculate_z_scores(obs, y_weather, std_weather)
+
+    thresholds = calculate_adaptive_threshold(
+        times,
+        base_threshold=base_threshold,
+    )
+
+    verdict_strings, verdict_codes, candidate_mask = (
+        generate_three_category_verdicts(
+            z_clim=z_clim,
+            z_weather=z_weather,
+            thresholds=thresholds,
+            observed=obs,
+            weather_pred=y_weather,
+        )
+    )
+
+    residual_weather = obs - y_weather
+
+    deviation_nature = classify_deviation_nature(
+        residual_weather,
+        candidate_mask,
+    )
+
     persistent_mask = apply_persistence_filter(
-        candidate_mask=candidate_mask,
+        candidate_mask,
         min_consecutive_passes=min_consecutive_passes,
-        sign_array=sign_array,
+        sign_array=residual_weather,
     )
 
-    # 7. Build rich NetCDF output Dataset
+    output_dims = reference.dims
+
     out_vars = {
         "observed_backscatter_db": (
-            "time", obs_db,
-            {"units": "dB", "long_name": f"Observed SAR {target_var.upper()} Backscatter"}
+            output_dims,
+            obs,
+            {"units": "dB"},
         ),
         "climatology_predicted_db": (
-            "time", y_clim,
-            {"units": "dB", "long_name": "Climatology Expected Backscatter"}
+            output_dims,
+            y_clim,
+            {"units": "dB"},
         ),
         "weather_predicted_db": (
-            "time", y_weather,
-            {"units": "dB", "long_name": "Weather-Aware Expected Backscatter"}
+            output_dims,
+            y_weather,
+            {"units": "dB"},
         ),
-        "weather_lower_bound_db": (
-            "time", weather_pred["lower_bound_db"].values,
-            {"units": "dB", "long_name": "Weather-Aware 10th Percentile Bound"}
+        "climatology_prediction_std": (
+            output_dims,
+            std_clim,
+            {"units": "dB"},
         ),
-        "weather_upper_bound_db": (
-            "time", weather_pred["upper_bound_db"].values,
-            {"units": "dB", "long_name": "Weather-Aware 90th Percentile Bound"}
+        "weather_prediction_std": (
+            output_dims,
+            std_weather,
+            {"units": "dB"},
+        ),
+        "residual_climatology_db": (
+            output_dims,
+            obs - y_clim,
+            {"units": "dB"},
+        ),
+        "residual_weather_db": (
+            output_dims,
+            residual_weather,
+            {"units": "dB"},
         ),
         "z_score_climatology": (
-            "time", z_clim,
-            {"units": "std_dev", "long_name": "Z-Score vs Seasonal Climatology"}
+            output_dims,
+            z_clim,
+            {"units": "standard_deviations"},
         ),
         "z_score_weather": (
-            "time", z_weather,
-            {"units": "std_dev", "long_name": "Z-Score vs Weather-Aware Model"}
+            output_dims,
+            z_weather,
+            {"units": "standard_deviations"},
         ),
         "adaptive_threshold": (
-            "time", thresholds,
-            {"units": "std_dev", "long_name": "Adaptive Anomaly Decision Threshold"}
+            ("time",),
+            thresholds,
+            {"units": "standard_deviations"},
         ),
         "verdict_code": (
-            "time", verdict_codes,
-            {"long_name": "Verdict Code (0=Expected, 1=Unusual Explained, 2=Unexplained Candidate, -1=Insufficient)"}
+            output_dims,
+            verdict_codes,
         ),
         "verdict_category": (
-            "time", np.asarray(verdict_strings, dtype=str),
-            {"long_name": "Three-Category Anomaly Verdict"}
+            output_dims,
+            verdict_strings,
         ),
         "is_anomaly_candidate": (
-            "time", candidate_mask.astype(int),
-            {"long_name": "Flag indicating unexplained candidate event before persistence filtering"}
+            output_dims,
+            candidate_mask,
         ),
         "is_persistent_anomaly": (
-            "time", persistent_mask.astype(int),
-            {"long_name": f"Confirmed anomaly persisting over ≥ {min_consecutive_passes} consecutive passes"}
+            output_dims,
+            persistent_mask,
         ),
         "deviation_nature": (
-            "time", np.asarray(deviation_nature, dtype=str),
-            {"long_name": "Physical nature of deviation (drop, jump, or expected)"}
+            output_dims,
+            deviation_nature,
         ),
     }
 
-    # Pass through relevant environmental covariates if available
-    covariates = [
-        ("rainfall_mm", "mm/day", "Daily Rainfall Depth"),
-        ("soil_moisture", "m³/m³", "Volumetric Soil Moisture"),
-        ("temperature_c", "°C", "Surface Temperature"),
-        ("antecedent_rain_3d_mm", "mm", "3-Day Antecedent Rainfall"),
-        ("antecedent_rain_7d_mm", "mm", "7-Day Antecedent Rainfall"),
-        ("vh_db", "dB", "Observed SAR VH Cross-Polarisation"),
-    ]
-    for cov_name, unit, long_name in covariates:
-        if isinstance(data, xr.Dataset) and cov_name in data:
-            out_vars[cov_name] = ("time", np.asarray(data[cov_name].values, dtype=float), {"units": unit, "long_name": long_name})
-        elif isinstance(data, pd.DataFrame) and cov_name in data.columns:
-            out_vars[cov_name] = ("time", np.asarray(data[cov_name].values, dtype=float), {"units": unit, "long_name": long_name})
+    for variable in (
+        "weather_lower_bound_db",
+        "weather_upper_bound_db",
+    ):
+        if variable in weather_pred:
+            values = _get_model_array(
+                weather_pred,
+                variable,
+                reference,
+            )
 
-    result_ds = xr.Dataset(data_vars=out_vars, coords={"time": times})
+            out_vars[variable] = (
+                output_dims,
+                values,
+                {"units": "dB"},
+            )
 
-    # Add spatial coordinates if available in input
-    if isinstance(data, xr.Dataset):
-        if "latitude" in data.coords:
-            result_ds.coords["latitude"] = data["latitude"].values
-        if "longitude" in data.coords:
-            result_ds.coords["longitude"] = data["longitude"].values
-
-    # Provenance and pipeline metadata
-    result_ds.attrs["title"] = "CounterSAR Anomaly Detection Pipeline Output"
-    result_ds.attrs["study_area"] = "Kuttanad, Kerala, India"
-    result_ds.attrs["target_variable"] = target_var
-    result_ds.attrs["base_threshold_z"] = base_threshold
-    result_ds.attrs["min_consecutive_passes"] = min_consecutive_passes
-    result_ds.attrs["total_observations"] = len(times)
-    result_ds.attrs["unexplained_candidates_count"] = int(np.sum(candidate_mask))
-    result_ds.attrs["persistent_anomalies_count"] = int(np.sum(persistent_mask))
-    result_ds.attrs["is_synthetic"] = is_synth
-    result_ds.attrs["crs"] = CRS
-    result_ds.attrs["notice"] = (
-        "⚠️ SYNTHETIC EVALUATION — Synthetic observations must not be used as evidence of real-world performance"
-        if is_synth else "CounterSAR Operational Output"
+    result_ds = xr.Dataset(
+        data_vars=out_vars,
+        coords=_get_spatial_coordinates(data),
     )
 
-    # 8. Export to NetCDF if path requested
-    if output_netcdf_path:
+    for variable in (
+        "rainfall_mm",
+        "soil_moisture",
+        "temperature_c",
+        "antecedent_rain_3d_mm",
+        "antecedent_rain_7d_mm",
+        "vh_db",
+        "valid_data_mask",
+        "water_mask",
+        "paddy_mask",
+    ):
+        if variable in data:
+            result_ds[variable] = data[variable]
+
+    is_synthetic = bool(data.attrs.get("is_synthetic", False))
+
+    result_ds.attrs.update({
+        "title": "CounterSAR Spatial Anomaly Detection Output",
+        "study_area": "Kuttanad, Kerala, India",
+        "target_variable": target_var,
+        "crs": data.attrs.get("crs", CRS),
+        "spatial_resolution_meters": data.attrs.get(
+            "spatial_resolution_meters",
+            100.0,
+        ),
+        "base_threshold_z": float(base_threshold),
+        "min_consecutive_passes": int(min_consecutive_passes),
+        "total_acquisitions": int(len(times)),
+        "candidate_pixel_observations": int(candidate_mask.sum()),
+        "persistent_pixel_observations": int(persistent_mask.sum()),
+        "is_synthetic": int(is_synthetic),
+        "notice": (
+            "SYNTHETIC EVALUATION. Results are not evidence of real-world "
+            "flood detection performance."
+            if is_synthetic
+            else "Anomaly candidates require independent validation."
+        ),
+    })
+
+    if output_netcdf_path is not None:
         export_pipeline_results(result_ds, output_netcdf_path)
 
     return result_ds
@@ -568,90 +525,143 @@ def export_pipeline_results(
     result_ds: xr.Dataset,
     output_path: Union[str, Path] = "results/pipeline_output.nc",
 ) -> Path:
-    """
-    Save pipeline output dataset to NetCDF (results/pipeline_output.nc)
-    with clean, sanitized attributes.
-    """
-    p = Path(output_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Sanitize boolean attributes for NetCDF-4 compatibility
+    if path.exists():
+        raise FileExistsError(
+            f"Output already exists: {path}. Choose another path or "
+            "move the existing file before exporting."
+        )
+
     clean_ds = result_ds.copy(deep=False)
-    for k, v in list(clean_ds.attrs.items()):
-        if isinstance(v, bool):
-            clean_ds.attrs[k] = int(v)
 
-    for var in clean_ds.data_vars:
-        for k, v in list(clean_ds[var].attrs.items()):
-            if isinstance(v, bool):
-                clean_ds[var].attrs[k] = int(v)
+    for key, value in list(clean_ds.attrs.items()):
+        if isinstance(value, bool):
+            clean_ds.attrs[key] = int(value)
 
-    clean_ds.to_netcdf(str(p), engine="netcdf4")
-    return p
+    clean_ds.to_netcdf(str(path), engine="netcdf4")
+
+    return path
 
 
-def to_anomaly_results(result_ds: xr.Dataset) -> List[AnomalyResult]:
-    """
-    Convert persistent and candidate anomalies into a list of shared AnomalyResult dataclasses.
-    """
+def to_anomaly_results(
+    result_ds: xr.Dataset,
+    max_results: Optional[int] = None,
+) -> List[AnomalyResult]:
     results = []
-    times = pd.to_datetime(result_ds["time"].values)
-    is_cand = result_ds["is_anomaly_candidate"].values
-    is_pers = result_ds["is_persistent_anomaly"].values
-    obs = result_ds["observed_backscatter_db"].values
-    pred = result_ds["weather_predicted_db"].values
-    z = result_ds["z_score_weather"].values
+
+    candidates = result_ds["is_anomaly_candidate"].values.astype(bool)
+    persistent = result_ds["is_persistent_anomaly"].values.astype(bool)
+
+    observed = result_ds["observed_backscatter_db"].values
+    predicted = result_ds["weather_predicted_db"].values
+    z_scores = result_ds["z_score_weather"].values
     nature = result_ds["deviation_nature"].values
-    is_synth = bool(result_ds.attrs.get("is_synthetic", False))
 
-    lat = KUTTANAD_BOUNDS["lat_min"] + 0.15
-    lon = KUTTANAD_BOUNDS["lon_min"] + 0.12
+    times = pd.to_datetime(result_ds.time.values)
+    is_synthetic = bool(result_ds.attrs.get("is_synthetic", False))
 
-    for i in range(len(times)):
-        if is_cand[i] or is_pers[i]:
-            results.append(
-                AnomalyResult(
-                    date=times[i].strftime("%Y-%m-%d"),
-                    latitude=lat,
-                    longitude=lon,
-                    observed_db=float(obs[i]),
-                    predicted_db=float(pred[i]),
-                    z_score=float(z[i]) if np.isfinite(z[i]) else 0.0,
-                    is_persistent=bool(is_pers[i]),
-                    anomaly_type=str(nature[i]),
-                    is_synthetic=is_synth,
-                )
+    if candidates.ndim == 1:
+        candidate_indices = np.flatnonzero(candidates)
+    else:
+        candidate_indices = np.argwhere(candidates)
+
+    if max_results is not None:
+        candidate_indices = candidate_indices[:max_results]
+
+    y_coords = result_ds.coords.get("y")
+    x_coords = result_ds.coords.get("x")
+
+    if y_coords is not None and x_coords is not None:
+        from pyproj import Transformer
+
+        transformer = Transformer.from_crs(
+            result_ds.attrs.get("crs", CRS),
+            "EPSG:4326",
+            always_xy=True,
+        )
+
+    for index in candidate_indices:
+        if candidates.ndim == 1:
+            t = int(index)
+            spatial_index = ()
+        else:
+            t = int(index[0])
+            spatial_index = tuple(index[1:])
+
+        if len(spatial_index) == 2 and x_coords is not None and y_coords is not None:
+            row, col = spatial_index
+
+            x = float(x_coords.values[col])
+            y = float(y_coords.values[row])
+
+            lon, lat = transformer.transform(x, y)
+
+        else:
+            lat = KUTTANAD_BOUNDS["lat_min"]
+            lon = KUTTANAD_BOUNDS["lon_min"]
+
+        obs_value = float(observed[(t,) + spatial_index])
+        pred_value = float(predicted[(t,) + spatial_index])
+        z_value = float(z_scores[(t,) + spatial_index])
+
+        results.append(
+            AnomalyResult(
+                date=times[t].strftime("%Y-%m-%d"),
+                latitude=float(lat),
+                longitude=float(lon),
+                observed_db=obs_value,
+                predicted_db=pred_value,
+                z_score=z_value,
+                is_persistent=bool(persistent[(t,) + spatial_index]),
+                anomaly_type=str(nature[(t,) + spatial_index]),
+                is_synthetic=is_synthetic,
             )
+        )
+
     return results
 
 
-# ════════════════════════════════════════════════════════════════════════
-#  7. STAGE 6: BENCHMARK EVALUATION & BASELINE COMPARISONS
-# ════════════════════════════════════════════════════════════════════════
+def compute_classification_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> Dict[str, float]:
+    y_t, y_p = np.broadcast_arrays(
+        np.asarray(y_true, dtype=bool),
+        np.asarray(y_pred, dtype=bool),
+    )
 
-def compute_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    """
-    Calculate Precision, Recall, F1-Score, False Alarm Rate (FAR),
-    Overall Accuracy, and Cohen's Kappa agreement.
-    """
-    y_t = np.asarray(y_true, dtype=bool)
-    y_p = np.asarray(y_pred, dtype=bool)
     tp = int(np.sum(y_t & y_p))
     fp = int(np.sum(~y_t & y_p))
     fn = int(np.sum(y_t & ~y_p))
     tn = int(np.sum(~y_t & ~y_p))
-    total = len(y_t)
 
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = (2.0 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-    far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-    accuracy = (tp + tn) / total if total > 0 else 0.0
+    total = len(y_t.ravel())
 
-    # Cohen's Kappa
-    po = accuracy
-    pe = (((tp + fn) * (tp + fp)) + ((tn + fp) * (tn + fn))) / (total ** 2) if total > 0 else 0.0
-    kappa = (po - pe) / (1.0 - pe) if (1.0 - pe) > 0 else 0.0
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision + recall
+        else 0.0
+    )
+
+    far = fp / (fp + tn) if fp + tn else 0.0
+    accuracy = (tp + tn) / total if total else 0.0
+
+    pe = (
+        ((tp + fn) * (tp + fp) + (tn + fp) * (tn + fn))
+        / (total ** 2)
+        if total
+        else 0.0
+    )
+
+    kappa = (
+        (accuracy - pe) / (1 - pe)
+        if total and (1 - pe) > 0
+        else 0.0
+    )
 
     return {
         "precision": round(precision, 3),
@@ -671,118 +681,158 @@ def run_stage6_benchmarks(
     target_var: str = "vv_db",
     random_seed: int = 42,
 ) -> Dict[str, Any]:
-    """
-    Rigorous benchmark comparison evaluating 5 distinct detection baselines
-    against an independent synthetic flood reference dataset over Kuttanad.
-
-    Evaluated Methods:
-      1. Seasonal Climatology Baseline (Dual-harmonic DOY regression)
-      2. Weather-Aware Prediction Model (LightGBM without persistence)
-      3. Image Differencing Baseline (Consecutive pass Δσ⁰ < −3 dB)
-      4. Log-Ratio Threshold Baseline (Ratio vs dry-season reference < −3 dB)
-      5. Complete CounterSAR Pipeline (Weather-Aware + Adaptive Threshold + Persistence Filter)
-
-    Returns
-    -------
-    dict with metrics, predictions, and comparative summary.
-    """
     from src.data_source import create_synthetic_datacube
 
-    # 1. Generate aligned synthetic data cube
-    cube = create_synthetic_datacube("2023-01-01", "2024-06-30")
+    cube = create_synthetic_datacube(
+        "2023-01-01",
+        "2024-06-30",
+    )
+
     times = pd.to_datetime(cube.time.values)
     n = len(times)
 
-    # 2. Construct independent synthetic flood reference dataset
-    # In Kuttanad, true flood / dike breach events are persistent multi-pass events:
-    # Event 1: Indices 18, 19 (July 2023 SW monsoon true breach, persistent across 2 passes)
-    # Event 2: Indices 35, 36 (November 2023 NE monsoon flood, persistent across 2 passes)
     ground_truth_events = np.zeros(n, dtype=bool)
     ground_truth_events[18:20] = True
     ground_truth_events[35:37] = True
 
-    # Inject the true flood signature into the observation series at event timesteps
-    # (sharp -5 to -6 dB drop simulating standing open floodwaters)
-    obs_vv = np.copy(cube[target_var].values)
-    obs_vv[18:20] -= 5.5
-    obs_vv[35:37] -= 5.0
-    cube[target_var] = ("time", obs_vv)
+    obs = np.copy(cube[target_var].values)
 
-    # ── Method 1: Seasonal Climatology Baseline ──
+    obs[18:20] -= 5.5
+    obs[35:37] -= 5.0
+
+    cube[target_var] = ("time", obs)
+
     clim_model = SeasonalClimatologyModel(num_harmonics=2)
     clim_model.fit(cube, target_var=target_var)
-    clim_res = clim_model.predict(cube)
+
+    clim_result = clim_model.predict(cube)
+
     z_clim = calculate_z_scores(
-        obs_vv,
-        clim_res["predicted_backscatter_db"].values,
-        clim_res["prediction_std"].values,
+        obs,
+        clim_result["predicted_backscatter_db"].values,
+        clim_result["prediction_std"].values,
     )
-    pred_m1 = z_clim < -2.0  # Significant drop vs seasonal norm
-    mae_m1 = float(np.nanmean(np.abs(obs_vv - clim_res["predicted_backscatter_db"].values)))
-    rmse_m1 = float(np.sqrt(np.nanmean((obs_vv - clim_res["predicted_backscatter_db"].values) ** 2)))
 
-    # ── Method 2: Weather-Aware Prediction Model (without persistence) ──
-    weather_model = WeatherAwareLGBMModel(alpha_lower=0.10, alpha_upper=0.90)
+    pred_m1 = z_clim < -2.0
+
+    mae_m1 = float(
+        np.nanmean(
+            np.abs(
+                obs - clim_result["predicted_backscatter_db"].values
+            )
+        )
+    )
+
+    rmse_m1 = float(
+        np.sqrt(
+            np.nanmean(
+                (
+                    obs
+                    - clim_result["predicted_backscatter_db"].values
+                ) ** 2
+            )
+        )
+    )
+
+    weather_model = WeatherAwareLGBMModel(
+        alpha_lower=0.10,
+        alpha_upper=0.90,
+    )
+
     weather_model.fit(cube, target_var=target_var)
-    weather_res = weather_model.predict(cube)
+    weather_result = weather_model.predict(cube)
+
     z_weather = calculate_z_scores(
-        obs_vv,
-        weather_res["predicted_backscatter_db"].values,
-        weather_res["prediction_std"].values,
+        obs,
+        weather_result["predicted_backscatter_db"].values,
+        weather_result["prediction_std"].values,
     )
-    pred_m2 = z_weather < -2.0  # Significant drop vs weather prediction
-    mae_m2 = float(np.nanmean(np.abs(obs_vv - weather_res["predicted_backscatter_db"].values)))
-    rmse_m2 = float(np.sqrt(np.nanmean((obs_vv - weather_res["predicted_backscatter_db"].values) ** 2)))
 
-    # ── Method 3: Image Differencing Baseline (Δσ⁰ < −3 dB) ──
-    delta_consecutive = np.zeros(n)
-    delta_consecutive[1:] = obs_vv[1:] - obs_vv[:-1]
-    pred_m3 = delta_consecutive < -3.0
+    pred_m2 = z_weather < -2.0
 
-    # ── Method 4: Log-Ratio Threshold Baseline (σ⁰ − σ⁰_ref < −3 dB) ──
-    # Reference is median dry-season backscatter (typically Jan–March)
+    mae_m2 = float(
+        np.nanmean(
+            np.abs(
+                obs
+                - weather_result["predicted_backscatter_db"].values
+            )
+        )
+    )
+
+    rmse_m2 = float(
+        np.sqrt(
+            np.nanmean(
+                (
+                    obs
+                    - weather_result["predicted_backscatter_db"].values
+                ) ** 2
+            )
+        )
+    )
+
+    delta = np.zeros(n)
+    delta[1:] = obs[1:] - obs[:-1]
+    pred_m3 = delta < -3.0
+
     dry_mask = times.month.isin([1, 2, 3])
-    dry_ref = float(np.nanmean(obs_vv[dry_mask]))
-    log_ratio_db = obs_vv - dry_ref
-    pred_m4 = log_ratio_db < -3.0
+    dry_reference = float(np.nanmean(obs[dry_mask]))
 
-    # ── Method 5: Complete CounterSAR Pipeline ──
-    # (Weather-Aware + Adaptive Threshold + Persistence Filtering)
-    thresholds = calculate_adaptive_threshold(times, base_threshold=2.0)
-    _, _, candidate_mask = generate_three_category_verdicts(
+    pred_m4 = (obs - dry_reference) < -3.0
+
+    thresholds = calculate_adaptive_threshold(times)
+
+    _, _, candidates = generate_three_category_verdicts(
         z_clim=z_clim,
         z_weather=z_weather,
         thresholds=thresholds,
-        observed=obs_vv,
-        weather_pred=weather_res["predicted_backscatter_db"].values,
+        observed=obs,
+        weather_pred=weather_result["predicted_backscatter_db"].values,
     )
-    sign_array = np.sign(obs_vv - weather_res["predicted_backscatter_db"].values)
-    pred_m5 = apply_persistence_filter(candidate_mask, min_consecutive_passes=2, sign_array=sign_array)
 
-    # Calculate metrics for all 5 methods
+    pred_m5 = apply_persistence_filter(
+        candidates,
+        min_consecutive_passes=2,
+        sign_array=obs - weather_result["predicted_backscatter_db"].values,
+    )
+
     results = {
-        "Image Differencing Baseline (Δσ⁰ < −3 dB)": {
-            **compute_classification_metrics(ground_truth_events, pred_m3),
+        "Image Differencing Baseline": {
+            **compute_classification_metrics(
+                ground_truth_events,
+                pred_m3,
+            ),
             "mae_db": np.nan,
             "rmse_db": np.nan,
         },
-        "Log-Ratio Threshold Baseline (Ratio vs Ref < −3 dB)": {
-            **compute_classification_metrics(ground_truth_events, pred_m4),
+        "Log-Ratio Threshold Baseline": {
+            **compute_classification_metrics(
+                ground_truth_events,
+                pred_m4,
+            ),
             "mae_db": np.nan,
             "rmse_db": np.nan,
         },
-        "Seasonal Climatology Baseline (|Z_clim| > 2.0)": {
-            **compute_classification_metrics(ground_truth_events, pred_m1),
+        "Seasonal Climatology Baseline": {
+            **compute_classification_metrics(
+                ground_truth_events,
+                pred_m1,
+            ),
             "mae_db": round(mae_m1, 3),
             "rmse_db": round(rmse_m1, 3),
         },
-        "Weather-Aware LightGBM (No Persistence)": {
-            **compute_classification_metrics(ground_truth_events, pred_m2),
+        "Weather-Aware LightGBM": {
+            **compute_classification_metrics(
+                ground_truth_events,
+                pred_m2,
+            ),
             "mae_db": round(mae_m2, 3),
             "rmse_db": round(rmse_m2, 3),
         },
-        "Complete CounterSAR Pipeline (Weather + Adaptive + Persistence)": {
-            **compute_classification_metrics(ground_truth_events, pred_m5),
+        "Complete CounterSAR Pipeline": {
+            **compute_classification_metrics(
+                ground_truth_events,
+                pred_m5,
+            ),
             "mae_db": round(mae_m2, 3),
             "rmse_db": round(rmse_m2, 3),
         },
@@ -793,6 +843,8 @@ def run_stage6_benchmarks(
         "n_observations": n,
         "ground_truth_flood_count": int(np.sum(ground_truth_events)),
         "is_synthetic": True,
-        "validation_note": "Synthetic benchmark evaluation: results generated via simulated Sentinel-1, CHIRPS, and ERA5 time series. Do not present as operational real-world performance.",
+        "validation_note": (
+            "Synthetic benchmark evaluation. Results are not evidence "
+            "of operational real-world flood detection performance."
+        ),
     }
-
